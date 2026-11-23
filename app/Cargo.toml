@@ -1,0 +1,15 @@
+[package]
+name = "pedalera"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+asio = ["engine/asio"]
+
+[dependencies]
+dsp = { path = "../crates/dsp" }
+engine = { path = "../crates/engine" }
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+ctrlc = "3.5"
