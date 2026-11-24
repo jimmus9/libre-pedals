@@ -404,190 +404,191 @@ fn draw_spectrum_and_waterfall(
     view_mode: TraceView,
     last_sr: u32,
 ) {
-        Frame::new()
-            .fill(Color32::from_rgb(11, 14, 19))
-            .corner_radius(CornerRadius::same(8))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(38, 45, 58)))
-            .inner_margin(Margin::same(10))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new("📊 ESPECTRO ARMÓNICO (FFT) Y ESPECTROGRAMA")
-                            .strong()
-                            .size(12.5)
-                            .color(Color32::from_rgb(203, 213, 225)),
-                    );
-                    ui.label("Cascada:");
-                    ui.selectable_value(
-                        waterfall_source,
-                        WaterfallSource::Post,
-                        "POST",
-                    );
-                    ui.selectable_value(
-                        waterfall_source,
-                        WaterfallSource::Pre,
-                        "PRE",
-                    );
-                });
-
-                ui.add_space(4.0);
-
-                // Parte superior: Espectro FFT PRE vs POST (log 40 Hz .. 16 kHz)
-                let plot_w = ui.available_width().max(180.0);
-                let (spec_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(plot_w, 128.0), Sense::hover());
-                let p = ui.painter();
-
-                p.rect(
-                    spec_rect,
-                    CornerRadius::same(6),
-                    Color32::from_rgb(8, 10, 14),
-                    Stroke::new(1.0, Color32::from_rgb(35, 42, 54)),
-                    StrokeKind::Inside,
+    Frame::new()
+        .fill(Color32::from_rgb(11, 14, 19))
+        .corner_radius(CornerRadius::same(8))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(38, 45, 58)))
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("📊 ESPECTRO ARMÓNICO (FFT) Y ESPECTROGRAMA")
+                        .strong()
+                        .size(12.5)
+                        .color(Color32::from_rgb(203, 213, 225)),
                 );
+                ui.label("Cascada:");
+                ui.selectable_value(waterfall_source, WaterfallSource::Post, "POST");
+                ui.selectable_value(waterfall_source, WaterfallSource::Pre, "PRE");
+            });
 
-                let log_min = MIN_FREQ_HZ.ln();
-                let log_span = (MAX_FREQ_HZ / MIN_FREQ_HZ).ln();
-                let freq_to_x = |f: f32| -> f32 {
-                    let u = ((f.ln() - log_min) / log_span).clamp(0.0, 1.0);
-                    spec_rect.min.x + u * spec_rect.width()
-                };
+            ui.add_space(4.0);
 
-                // Rejilla de frecuencias
-                for (f, lbl) in [
-                    (60.0, "60"),
-                    (125.0, "125"),
-                    (250.0, "250"),
-                    (500.0, "500"),
-                    (1_000.0, "1k"),
-                    (2_000.0, "2k"),
-                    (4_000.0, "4k"),
-                    (8_000.0, "8k"),
-                ] {
-                    let x = freq_to_x(f);
-                    p.line_segment(
-                        [Pos2::new(x, spec_rect.min.y), Pos2::new(x, spec_rect.max.y)],
-                        Stroke::new(0.8, Color32::from_rgb(26, 31, 40)),
-                    );
-                    p.text(
-                        Pos2::new(x + 2.0, spec_rect.max.y - 4.0),
-                        Align2::LEFT_BOTTOM,
-                        lbl,
-                        FontId::monospace(9.5),
-                        Color32::from_rgb(95, 108, 128),
-                    );
-                }
+            // Parte superior: Espectro FFT PRE vs POST (log 40 Hz .. 16 kHz)
+            let plot_w = ui.available_width().max(180.0);
+            let (spec_rect, _) = ui.allocate_exact_size(Vec2::new(plot_w, 128.0), Sense::hover());
+            let p = ui.painter();
 
-                // Rejilla de dB (-80 .. 0 dB / dBr)
-                let db_min = -80.0_f32;
-                let db_max = 3.0_f32;
-                let db_to_y = |db: f32| -> f32 {
-                    let n = ((db - db_min) / (db_max - db_min)).clamp(0.0, 1.0);
-                    spec_rect.max.y - n * spec_rect.height()
-                };
-                for db_line in [0.0_f32, -20.0, -40.0, -60.0] {
-                    let y = db_to_y(db_line);
-                    p.line_segment(
-                        [Pos2::new(spec_rect.min.x, y), Pos2::new(spec_rect.max.x, y)],
-                        Stroke::new(0.8, Color32::from_rgb(28, 34, 44)),
-                    );
-                    let tag = if relative_ref {
-                        format!("{db_line:.0} dBr")
-                    } else {
-                        format!("{db_line:.0} dB")
-                    };
-                    p.text(
-                        Pos2::new(spec_rect.min.x + 4.0, y - 2.0),
-                        Align2::LEFT_BOTTOM,
-                        tag,
-                        FontId::monospace(9.5),
-                        Color32::from_rgb(95, 108, 128),
-                    );
-                }
+            p.rect(
+                spec_rect,
+                CornerRadius::same(6),
+                Color32::from_rgb(8, 10, 14),
+                Stroke::new(1.0, Color32::from_rgb(35, 42, 54)),
+                StrokeKind::Inside,
+            );
 
-                let pre_ref = if relative_ref {
-                    let pk = peak_in_band(smooth_pre_spec, last_sr);
-                    if pk > -75.0 { pk } else { 0.0 }
-                } else {
-                    0.0
-                };
-                let post_ref = if relative_ref {
-                    let pk = peak_in_band(smooth_post_spec, last_sr);
-                    if pk > -75.0 { pk } else { 0.0 }
-                } else {
-                    0.0
-                };
+            let log_min = MIN_FREQ_HZ.ln();
+            let log_span = (MAX_FREQ_HZ / MIN_FREQ_HZ).ln();
+            let freq_to_x = |f: f32| -> f32 {
+                let u = ((f.ln() - log_min) / log_span).clamp(0.0, 1.0);
+                spec_rect.min.x + u * spec_rect.width()
+            };
 
-                let paint_spec = |spec: &[f32], ref_db: f32, color: Color32, width: f32| {
-                    let cols = (spec_rect.width() as usize).clamp(64, 320);
-                    let bin_hz = last_sr as f32 / FFT_LEN as f32;
-                    let mut pts = Vec::with_capacity(cols);
-                    for i in 0..cols {
-                        let u = i as f32 / (cols - 1) as f32;
-                        let freq = (log_min + u * log_span).exp();
-                        let bin_f = (freq / bin_hz).clamp(1.0, (FFT_BINS - 2) as f32);
-                        let b0 = bin_f.floor() as usize;
-                        let frac = bin_f - b0 as f32;
-                        let raw_db = spec[b0] * (1.0 - frac) + spec[b0 + 1] * frac;
-                        let rel_db = raw_db - ref_db;
-                        pts.push(Pos2::new(spec_rect.min.x + u * spec_rect.width(), db_to_y(rel_db)));
-                    }
-                    p.line(pts, Stroke::new(width, color));
-                };
-
-                if matches!(view_mode, TraceView::Both | TraceView::PreOnly) {
-                    paint_spec(
-                        smooth_pre_spec,
-                        pre_ref,
-                        Color32::from_rgb(56, 189, 248),
-                        1.7,
-                    );
-                }
-                if matches!(view_mode, TraceView::Both | TraceView::PostOnly) {
-                    paint_spec(
-                        smooth_post_spec,
-                        post_ref,
-                        Color32::from_rgb(251, 146, 60),
-                        2.0,
-                    );
-                }
-
-                ui.add_space(6.0);
-
-                // Parte inferior: Espectrograma 2D (Waterfall tiempo x frecuencia)
-                let (wf_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(plot_w, 102.0), Sense::hover());
-                let p = ui.painter();
-                if let Some(tex) = waterfall_tex {
-                    p.image(
-                        tex.id(),
-                        wf_rect,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-                } else {
-                    p.rect_filled(wf_rect, CornerRadius::same(4), Color32::from_rgb(8, 10, 15));
-                }
-                p.rect_stroke(
-                    wf_rect,
-                    CornerRadius::same(4),
-                    Stroke::new(1.0, Color32::from_rgb(35, 42, 54)),
-                    StrokeKind::Inside,
+            // Rejilla de frecuencias
+            for (f, lbl) in [
+                (60.0, "60"),
+                (125.0, "125"),
+                (250.0, "250"),
+                (500.0, "500"),
+                (1_000.0, "1k"),
+                (2_000.0, "2k"),
+                (4_000.0, "4k"),
+                (8_000.0, "8k"),
+            ] {
+                let x = freq_to_x(f);
+                p.line_segment(
+                    [Pos2::new(x, spec_rect.min.y), Pos2::new(x, spec_rect.max.y)],
+                    Stroke::new(0.8, Color32::from_rgb(26, 31, 40)),
                 );
                 p.text(
-                    Pos2::new(wf_rect.min.x + 6.0, wf_rect.min.y + 4.0),
-                    Align2::LEFT_TOP,
-                    format!(
-                        "Espectrograma {} (40 Hz → 16 kHz · Tiempo ↓)",
-                        match *waterfall_source {
-                            WaterfallSource::Post => "POST",
-                            WaterfallSource::Pre => "PRE",
-                        }
-                    ),
-                    FontId::proportional(10.5),
-                    Color32::from_rgba_unmultiplied(230, 236, 245, 200),
+                    Pos2::new(x + 2.0, spec_rect.max.y - 4.0),
+                    Align2::LEFT_BOTTOM,
+                    lbl,
+                    FontId::monospace(9.5),
+                    Color32::from_rgb(95, 108, 128),
                 );
-            });
+            }
+
+            // Rejilla de dB (-80 .. 0 dB / dBr)
+            let db_min = -80.0_f32;
+            let db_max = 3.0_f32;
+            let db_to_y = |db: f32| -> f32 {
+                let n = ((db - db_min) / (db_max - db_min)).clamp(0.0, 1.0);
+                spec_rect.max.y - n * spec_rect.height()
+            };
+            for db_line in [0.0_f32, -20.0, -40.0, -60.0] {
+                let y = db_to_y(db_line);
+                p.line_segment(
+                    [Pos2::new(spec_rect.min.x, y), Pos2::new(spec_rect.max.x, y)],
+                    Stroke::new(0.8, Color32::from_rgb(28, 34, 44)),
+                );
+                let tag = if relative_ref {
+                    format!("{db_line:.0} dBr")
+                } else {
+                    format!("{db_line:.0} dB")
+                };
+                p.text(
+                    Pos2::new(spec_rect.min.x + 4.0, y - 2.0),
+                    Align2::LEFT_BOTTOM,
+                    tag,
+                    FontId::monospace(9.5),
+                    Color32::from_rgb(95, 108, 128),
+                );
+            }
+
+            let pre_ref = if relative_ref {
+                let pk = peak_in_band(smooth_pre_spec, last_sr);
+                if pk > -75.0 {
+                    pk
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let post_ref = if relative_ref {
+                let pk = peak_in_band(smooth_post_spec, last_sr);
+                if pk > -75.0 {
+                    pk
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            let paint_spec = |spec: &[f32], ref_db: f32, color: Color32, width: f32| {
+                let cols = (spec_rect.width() as usize).clamp(64, 320);
+                let bin_hz = last_sr as f32 / FFT_LEN as f32;
+                let mut pts = Vec::with_capacity(cols);
+                for i in 0..cols {
+                    let u = i as f32 / (cols - 1) as f32;
+                    let freq = (log_min + u * log_span).exp();
+                    let bin_f = (freq / bin_hz).clamp(1.0, (FFT_BINS - 2) as f32);
+                    let b0 = bin_f.floor() as usize;
+                    let frac = bin_f - b0 as f32;
+                    let raw_db = spec[b0] * (1.0 - frac) + spec[b0 + 1] * frac;
+                    let rel_db = raw_db - ref_db;
+                    pts.push(Pos2::new(
+                        spec_rect.min.x + u * spec_rect.width(),
+                        db_to_y(rel_db),
+                    ));
+                }
+                p.line(pts, Stroke::new(width, color));
+            };
+
+            if matches!(view_mode, TraceView::Both | TraceView::PreOnly) {
+                paint_spec(
+                    smooth_pre_spec,
+                    pre_ref,
+                    Color32::from_rgb(56, 189, 248),
+                    1.7,
+                );
+            }
+            if matches!(view_mode, TraceView::Both | TraceView::PostOnly) {
+                paint_spec(
+                    smooth_post_spec,
+                    post_ref,
+                    Color32::from_rgb(251, 146, 60),
+                    2.0,
+                );
+            }
+
+            ui.add_space(6.0);
+
+            // Parte inferior: Espectrograma 2D (Waterfall tiempo x frecuencia)
+            let (wf_rect, _) = ui.allocate_exact_size(Vec2::new(plot_w, 102.0), Sense::hover());
+            let p = ui.painter();
+            if let Some(tex) = waterfall_tex {
+                p.image(
+                    tex.id(),
+                    wf_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            } else {
+                p.rect_filled(wf_rect, CornerRadius::same(4), Color32::from_rgb(8, 10, 15));
+            }
+            p.rect_stroke(
+                wf_rect,
+                CornerRadius::same(4),
+                Stroke::new(1.0, Color32::from_rgb(35, 42, 54)),
+                StrokeKind::Inside,
+            );
+            p.text(
+                Pos2::new(wf_rect.min.x + 6.0, wf_rect.min.y + 4.0),
+                Align2::LEFT_TOP,
+                format!(
+                    "Espectrograma {} (40 Hz → 16 kHz · Tiempo ↓)",
+                    match *waterfall_source {
+                        WaterfallSource::Post => "POST",
+                        WaterfallSource::Pre => "PRE",
+                    }
+                ),
+                FontId::proportional(10.5),
+                Color32::from_rgba_unmultiplied(230, 236, 245, 200),
+            );
+        });
 }
 
 struct ScopeWindow<'a> {
@@ -629,12 +630,7 @@ fn draw_single_oscilloscope(ui: &mut egui::Ui, is_pre: bool, scope: &ScopeWindow
         ))
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(title)
-                    .strong()
-                    .size(12.5)
-                    .color(accent),
-            );
+            ui.label(egui::RichText::new(title).strong().size(12.5).color(accent));
 
             let metric_text = match extra_delta {
                 None => format!(
@@ -759,10 +755,6 @@ fn waterfall_color(norm: f32) -> Color32 {
         )
     } else {
         let u = (t - 0.82) / 0.18;
-        Color32::from_rgb(
-            255,
-            (223.0 - u * 155.0) as u8,
-            (40.0 + u * 20.0) as u8,
-        )
+        Color32::from_rgb(255, (223.0 - u * 155.0) as u8, (40.0 + u * 20.0) as u8)
     }
 }

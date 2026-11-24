@@ -22,7 +22,11 @@ pub struct Gain {
 
 impl Gain {
     pub fn new(db: f32) -> Self {
-        let db = if db.is_finite() { db.clamp(-120.0, 24.0) } else { 0.0 };
+        let db = if db.is_finite() {
+            db.clamp(-120.0, 24.0)
+        } else {
+            0.0
+        };
         let lin = db_to_lin(db);
         let ramp_samples = 480.0; // 10 ms @ 48 kHz
         Self {
@@ -35,15 +39,19 @@ impl Gain {
     }
 
     pub fn set_db(&mut self, db: f32) {
-        let db = if db.is_finite() { db.clamp(-120.0, 24.0) } else { -120.0 };
+        let db = if db.is_finite() {
+            db.clamp(-120.0, 24.0)
+        } else {
+            -120.0
+        };
         let new_lin = db_to_lin(db);
         if (new_lin - self.target_lin).abs() <= f32::EPSILON {
             return;
         }
         self.db = db;
         self.target_lin = new_lin;
-        self.step = ((self.target_lin - self.current_lin).abs() / self.ramp_samples.max(1.0))
-            .max(1e-7);
+        self.step =
+            ((self.target_lin - self.current_lin).abs() / self.ramp_samples.max(1.0)).max(1e-7);
     }
 
     pub fn db(&self) -> f32 {
@@ -81,8 +89,7 @@ impl Effect for Gain {
         let sr = sample_rate.max(1.0);
         self.ramp_samples = (0.010 * sr).max(1.0);
         if (self.target_lin - self.current_lin).abs() > f32::EPSILON {
-            self.step = ((self.target_lin - self.current_lin).abs() / self.ramp_samples)
-                .max(1e-7);
+            self.step = ((self.target_lin - self.current_lin).abs() / self.ramp_samples).max(1e-7);
         }
     }
 

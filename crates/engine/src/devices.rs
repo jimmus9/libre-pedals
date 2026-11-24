@@ -248,11 +248,7 @@ pub(crate) fn resolve_devices(
     }
 }
 
-fn find_matching_device<I>(
-    devices: I,
-    needle: &str,
-    role: &str,
-) -> Result<(Device, String)>
+fn find_matching_device<I>(devices: I, needle: &str, role: &str) -> Result<(Device, String)>
 where
     I: Iterator<Item = Device>,
 {

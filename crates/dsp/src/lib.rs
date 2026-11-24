@@ -336,9 +336,7 @@ mod tests {
         let mut gain = Gain::new(0.0);
         gain.prepare(48_000.0, 256);
 
-        let original: Vec<f32> = (0..256)
-            .map(|i| (i as f32 * 0.123).sin() * 0.75)
-            .collect();
+        let original: Vec<f32> = (0..256).map(|i| (i as f32 * 0.123).sin() * 0.75).collect();
         let mut buf = original.clone();
         gain.process(&mut buf);
 

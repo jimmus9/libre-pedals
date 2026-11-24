@@ -93,9 +93,9 @@ impl Engine {
         let in_default = in_dev
             .default_input_config()
             .with_context(|| format!("El dispositivo de entrada '{in_name}' no soporta captura"))?;
-        let out_default = out_dev
-            .default_output_config()
-            .with_context(|| format!("El dispositivo de salida '{out_name}' no soporta reproducción"))?;
+        let out_default = out_dev.default_output_config().with_context(|| {
+            format!("El dispositivo de salida '{out_name}' no soporta reproducción")
+        })?;
 
         let (in_supported, out_supported) = resolve_native_configs(
             &in_dev,
@@ -154,10 +154,12 @@ impl Engine {
             (a, b) => a.or(b),
         };
 
-        let prefill_frames = cfg.latency_frames.unwrap_or_else(|| match nominal_proc_buf {
-            Some(b) if b > 0 => b.saturating_mul(2),
-            _ => 512_u32.saturating_mul((proc_sample_rate / 48_000).max(1)),
-        });
+        let prefill_frames = cfg
+            .latency_frames
+            .unwrap_or_else(|| match nominal_proc_buf {
+                Some(b) if b > 0 => b.saturating_mul(2),
+                _ => 512_u32.saturating_mul((proc_sample_rate / 48_000).max(1)),
+            });
 
         let ring_capacity = (prefill_frames as usize).saturating_mul(8).max(32_768);
         let drift_control = matches!(cfg.host, HostKind::Wasapi);
@@ -192,7 +194,8 @@ impl Engine {
         let input_buffer_frames = input_stream.buffer_size().ok();
         let output_buffer_frames = output_stream.buffer_size().ok();
 
-        let actual_in_proc = input_buffer_frames.map(|b| scale_frames(b, in_sample_rate, proc_sample_rate));
+        let actual_in_proc =
+            input_buffer_frames.map(|b| scale_frames(b, in_sample_rate, proc_sample_rate));
         let actual_out_proc =
             output_buffer_frames.map(|b| scale_frames(b, out_sample_rate, proc_sample_rate));
         let drift_buf = match (actual_in_proc, actual_out_proc) {
@@ -260,6 +263,8 @@ fn scale_frames(frames: u32, from_sr: u32, to_sr: u32) -> u32 {
     }
 }
 
+type StreamPairResult = Result<(Stream, Stream, Consumer<(f32, f32)>)>;
+
 #[allow(clippy::too_many_arguments)]
 fn build_stream_pair_with_fallback(
     in_dev: &Device,
@@ -276,7 +281,7 @@ fn build_stream_pair_with_fallback(
     meters: &Arc<Meters>,
     max_ring_fill: &Arc<AtomicU32>,
     warnings: &mut Vec<String>,
-) -> Result<(Stream, Stream, Consumer<(f32, f32)>)> {
+) -> StreamPairResult {
     let mut in_buf_mode = requested_buf;
     let mut out_buf_mode = requested_buf;
 
@@ -399,7 +404,11 @@ fn resolve_native_configs(
     for candidate_sr in [48_000_u32, 44_100, 96_000] {
         if let (Some(in_cfg), Some(out_cfg)) = (
             pick_config_for_rate(in_default, in_dev.supported_input_configs(), candidate_sr),
-            pick_config_for_rate(out_default, out_dev.supported_output_configs(), candidate_sr),
+            pick_config_for_rate(
+                out_default,
+                out_dev.supported_output_configs(),
+                candidate_sr,
+            ),
         ) {
             return Ok((in_cfg, out_cfg));
         }
@@ -486,21 +495,46 @@ fn build_input_for_format(
     meters: Arc<Meters>,
 ) -> Result<Stream> {
     match format {
-        SampleFormat::F32 => {
-            build_input_typed::<f32>(dev, config, proc_sample_rate, input_channel, producer, meters)
-        }
-        SampleFormat::I16 => {
-            build_input_typed::<i16>(dev, config, proc_sample_rate, input_channel, producer, meters)
-        }
-        SampleFormat::I32 => {
-            build_input_typed::<i32>(dev, config, proc_sample_rate, input_channel, producer, meters)
-        }
-        SampleFormat::U16 => {
-            build_input_typed::<u16>(dev, config, proc_sample_rate, input_channel, producer, meters)
-        }
-        SampleFormat::F64 => {
-            build_input_typed::<f64>(dev, config, proc_sample_rate, input_channel, producer, meters)
-        }
+        SampleFormat::F32 => build_input_typed::<f32>(
+            dev,
+            config,
+            proc_sample_rate,
+            input_channel,
+            producer,
+            meters,
+        ),
+        SampleFormat::I16 => build_input_typed::<i16>(
+            dev,
+            config,
+            proc_sample_rate,
+            input_channel,
+            producer,
+            meters,
+        ),
+        SampleFormat::I32 => build_input_typed::<i32>(
+            dev,
+            config,
+            proc_sample_rate,
+            input_channel,
+            producer,
+            meters,
+        ),
+        SampleFormat::U16 => build_input_typed::<u16>(
+            dev,
+            config,
+            proc_sample_rate,
+            input_channel,
+            producer,
+            meters,
+        ),
+        SampleFormat::F64 => build_input_typed::<f64>(
+            dev,
+            config,
+            proc_sample_rate,
+            input_channel,
+            producer,
+            meters,
+        ),
         other => bail!("Formato de muestra de entrada no soportado: {other}"),
     }
 }
@@ -689,7 +723,8 @@ where
             let muted = params.mute();
 
             if drift_control {
-                let min_keep_proc = scale_frames(frames_needed as u32, out_sample_rate, proc_sample_rate) as usize;
+                let min_keep_proc =
+                    scale_frames(frames_needed as u32, out_sample_rate, proc_sample_rate) as usize;
                 let max_fill = max_ring_fill.load(Ordering::Relaxed) as usize;
                 let avail = consumer.slots();
                 if avail > max_fill && avail > min_keep_proc {

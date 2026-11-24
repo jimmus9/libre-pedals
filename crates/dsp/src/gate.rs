@@ -115,9 +115,11 @@ impl Effect for NoiseGate {
             let level = x.abs();
 
             if level > self.envelope {
-                self.envelope = self.attack_coeff * self.envelope + (1.0 - self.attack_coeff) * level;
+                self.envelope =
+                    self.attack_coeff * self.envelope + (1.0 - self.attack_coeff) * level;
             } else {
-                self.envelope = self.release_coeff * self.envelope + (1.0 - self.release_coeff) * level;
+                self.envelope =
+                    self.release_coeff * self.envelope + (1.0 - self.release_coeff) * level;
             }
             if self.envelope < 1e-12 {
                 self.envelope = 0.0;
@@ -150,6 +152,10 @@ impl Effect for NoiseGate {
     fn reset(&mut self) {
         self.hold_counter = 0;
         self.envelope = 0.0;
-        self.gain = if self.threshold_db <= -100.0 { 1.0 } else { 0.0 };
+        self.gain = if self.threshold_db <= -100.0 {
+            1.0
+        } else {
+            0.0
+        };
     }
 }

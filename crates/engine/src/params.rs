@@ -100,9 +100,7 @@ impl PedalParamSlot {
 
     #[inline]
     pub fn get(&self, param_idx: usize) -> f32 {
-        self.values
-            .get(param_idx)
-            .map_or(0.0, |atom| atom.load())
+        self.values.get(param_idx).map_or(0.0, |atom| atom.load())
     }
 
     #[inline]

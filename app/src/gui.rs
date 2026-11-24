@@ -9,8 +9,8 @@ use eframe::egui::{
     StrokeKind, Vec2,
 };
 use engine::{
-    list_devices, Engine, EngineConfig, HostKind, HostReport, InitialParams, MeterSnapshot,
-    Meters, Params, PedalParamSlot,
+    list_devices, Engine, EngineConfig, HostKind, HostReport, InitialParams, MeterSnapshot, Meters,
+    Params, PedalParamSlot,
 };
 
 use crate::analyzer_ui::AnalyzerState;
@@ -23,14 +23,8 @@ pub struct GuiStartOptions {
     pub mute: bool,
 }
 
-const BUFFER_OPTIONS: [Option<u32>; 6] = [
-    None,
-    Some(64),
-    Some(128),
-    Some(256),
-    Some(512),
-    Some(1024),
-];
+const BUFFER_OPTIONS: [Option<u32>; 6] =
+    [None, Some(64), Some(128), Some(256), Some(512), Some(1024)];
 
 const PROC_RATE_OPTIONS: [Option<u32>; 5] = [
     None,
@@ -147,7 +141,12 @@ impl PedalboardApp {
                 h.devices
                     .iter()
                     .filter(|d| d.input_channels.unwrap_or(0) > 0)
-                    .map(|d| (d.name.clone(), d.default_input.as_ref().map(|c| c.sample_rate)))
+                    .map(|d| {
+                        (
+                            d.name.clone(),
+                            d.default_input.as_ref().map(|c| c.sample_rate),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -159,7 +158,12 @@ impl PedalboardApp {
                 h.devices
                     .iter()
                     .filter(|d| d.output_channels.unwrap_or(0) > 0)
-                    .map(|d| (d.name.clone(), d.default_output.as_ref().map(|c| c.sample_rate)))
+                    .map(|d| {
+                        (
+                            d.name.clone(),
+                            d.default_output.as_ref().map(|c| c.sample_rate),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -204,7 +208,11 @@ impl PedalboardApp {
                 .devices
                 .iter()
                 .find(|d| d.is_default_input && d.input_channels.unwrap_or(0) > 0)
-                .or_else(|| host.devices.iter().find(|d| d.input_channels.unwrap_or(0) > 0));
+                .or_else(|| {
+                    host.devices
+                        .iter()
+                        .find(|d| d.input_channels.unwrap_or(0) > 0)
+                });
             let def_in_name = def_in_dev.map(|d| d.name.clone());
             let in_rate = self
                 .selected_input
@@ -218,7 +226,9 @@ impl PedalboardApp {
                 .iter()
                 .find(|d| d.is_default_output && d.output_channels.unwrap_or(0) > 0);
             let same_rate_out = in_rate.and_then(|sr| {
-                if sys_def_out.and_then(|d| d.default_output.as_ref().map(|c| c.sample_rate)) == Some(sr) {
+                if sys_def_out.and_then(|d| d.default_output.as_ref().map(|c| c.sample_rate))
+                    == Some(sr)
+                {
                     sys_def_out
                 } else {
                     host.devices.iter().find(|d| {
@@ -229,7 +239,11 @@ impl PedalboardApp {
             });
             let def_out_name = same_rate_out
                 .or(sys_def_out)
-                .or_else(|| host.devices.iter().find(|d| d.output_channels.unwrap_or(0) > 0))
+                .or_else(|| {
+                    host.devices
+                        .iter()
+                        .find(|d| d.output_channels.unwrap_or(0) > 0)
+                })
                 .map(|d| d.name.clone());
 
             (def_in_name, in_rate, def_out_name)
@@ -287,7 +301,9 @@ impl PedalboardApp {
             self.selected_output = self.selected_input.clone();
         }
 
-        if let (Some(req_sr), Some(in_sr)) = (self.selected_proc_rate, self.selected_input_native_rate()) {
+        if let (Some(req_sr), Some(in_sr)) =
+            (self.selected_proc_rate, self.selected_input_native_rate())
+        {
             if req_sr > in_sr {
                 self.resolution_warning = Some(format!(
                     "⚠ Resolución {req_sr} Hz supera la frecuencia nativa de entrada ({in_sr} Hz). Se usa nativa ({in_sr} Hz)."
@@ -333,7 +349,10 @@ impl PedalboardApp {
 
     fn update_meters(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
-        let dt = now.duration_since(self.last_frame_time).as_secs_f32().min(0.2);
+        let dt = now
+            .duration_since(self.last_frame_time)
+            .as_secs_f32()
+            .min(0.2);
         self.last_frame_time = now;
 
         let proc_sr = self
@@ -1086,8 +1105,7 @@ impl eframe::App for PedalboardApp {
         self.update_meters(ui.ctx());
         self.draw_studio_rack(ui);
         self.draw_cascade_board(ui);
-        ui.ctx()
-            .request_repaint_after(Duration::from_millis(33));
+        ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
 }
 
@@ -1135,13 +1153,7 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
     }
 }
 
-fn draw_level_meter(
-    ui: &mut egui::Ui,
-    title: &str,
-    db: f32,
-    marker_db: Option<f32>,
-    muted: bool,
-) {
+fn draw_level_meter(ui: &mut egui::Ui, title: &str, db: f32, marker_db: Option<f32>, muted: bool) {
     const MIN_DB: f32 = -60.0;
     const MAX_DB: f32 = 0.0;
 
@@ -1258,7 +1270,10 @@ fn draw_signal_arrow(ui: &mut egui::Ui, height: f32, active: bool) {
     let y = rect.center().y;
     let p = ui.painter();
     p.line_segment(
-        [Pos2::new(rect.min.x + 1.0, y), Pos2::new(rect.max.x - 3.0, y)],
+        [
+            Pos2::new(rect.min.x + 1.0, y),
+            Pos2::new(rect.max.x - 3.0, y),
+        ],
         Stroke::new(2.5, color),
     );
     p.line_segment(
@@ -1414,7 +1429,8 @@ fn draw_stompbox_pedal(
             let indices: Vec<usize> = (0..knob_count).collect();
             for row in indices.chunks(3) {
                 let item_gap = if row.len() == 3 { 6.0 } else { 14.0 };
-                let row_w = row.len() as f32 * knob_w + (row.len().saturating_sub(1) as f32) * item_gap;
+                let row_w =
+                    row.len() as f32 * knob_w + (row.len().saturating_sub(1) as f32) * item_gap;
                 let side_pad = ((pedal_width - 20.0 - row_w) * 0.5).max(0.0);
 
                 ui.horizontal(|ui| {
@@ -1544,7 +1560,10 @@ fn draw_rotary_knob(
                 center + Vec2::new(a.sin(), -a.cos()) * outer_radius
             })
             .collect();
-        p.line(bg_points, Stroke::new(3.5 * scale.min(1.15), Color32::from_rgb(48, 55, 68)));
+        p.line(
+            bg_points,
+            Stroke::new(3.5 * scale.min(1.15), Color32::from_rgb(48, 55, 68)),
+        );
 
         let active_steps = ((norm * 28.0).ceil() as usize).max(1);
         if norm > 0.005 {
@@ -1582,7 +1601,10 @@ fn draw_rotary_knob(
             Color32::from_rgb(140, 148, 160)
         };
         p.line_segment(
-            [center + dir * (5.0 * scale), center + dir * (body_radius - 3.0)],
+            [
+                center + dir * (5.0 * scale),
+                center + dir * (body_radius - 3.0),
+            ],
             Stroke::new(2.5 * scale.min(1.1), pointer_color),
         );
 

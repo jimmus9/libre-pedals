@@ -12,9 +12,7 @@ use std::{
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use engine::{
-    list_devices, Engine, EngineConfig, HostKind, InitialParams, Meters, Params,
-};
+use engine::{list_devices, Engine, EngineConfig, HostKind, InitialParams, Meters, Params};
 use gui::{run_gui, GuiStartOptions};
 
 #[derive(Parser)]
@@ -128,7 +126,10 @@ struct RunArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command.unwrap_or_else(|| Command::Gui(GuiArgs::default())) {
+    match cli
+        .command
+        .unwrap_or_else(|| Command::Gui(GuiArgs::default()))
+    {
         Command::Gui(args) => cmd_gui(args),
         Command::List => cmd_list(),
         Command::Run(args) => cmd_run(args),
@@ -195,7 +196,9 @@ fn cmd_list() -> Result<()> {
     }
 
     #[cfg(not(feature = "asio"))]
-    println!("\nNota: esta compilación no incluye ASIO. Compila con '--features asio' para habilitarlo.");
+    println!(
+        "\nNota: esta compilación no incluye ASIO. Compila con '--features asio' para habilitarlo."
+    );
 
     Ok(())
 }
@@ -265,7 +268,10 @@ fn cmd_run(args: RunArgs) -> Result<()> {
             info.input_sample_rate, info.processing_sample_rate, info.output_sample_rate
         );
     } else {
-        println!("Sample rate:    {} Hz (1:1 sin resampleo)", info.sample_rate);
+        println!(
+            "Sample rate:    {} Hz (1:1 sin resampleo)",
+            info.sample_rate
+        );
     }
     println!(
         "Buffers:        entrada={} frames, salida={} frames, ring prefill={} frames",
