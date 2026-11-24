@@ -398,7 +398,7 @@ fn sync_chain_from_params(chain: &mut Chain, params: &Params) {
     chain.sync_order_from(|pos| params.order_at(pos));
     for (slot_idx, slot_params) in params.slots().iter().enumerate() {
         if let Some((fx, bypass)) = chain.slot_mut(slot_idx) {
-            *bypass = slot_params.bypass();
+            *bypass = slot_params.bypass() || !slot_params.is_mounted();
             for p_idx in 0..slot_params.param_count() {
                 fx.set_param(p_idx, slot_params.get(p_idx));
             }

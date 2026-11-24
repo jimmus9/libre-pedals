@@ -86,8 +86,10 @@ pub struct PedalParamSlot {
     pub name: &'static str,
     pub accent_color: [u8; 3],
     pub specs: &'static [ParamSpec],
+    pub is_master: bool,
     values: Box<[AtomicF32]>,
     bypass: AtomicBool,
+    mounted: AtomicBool,
 }
 
 impl PedalParamSlot {
@@ -125,6 +127,16 @@ impl PedalParamSlot {
     pub fn set_bypass(&self, bypass: bool) {
         self.bypass.store(bypass, Ordering::Relaxed);
     }
+
+    #[inline]
+    pub fn is_mounted(&self) -> bool {
+        self.mounted.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn set_mounted(&self, mounted: bool) {
+        self.mounted.store(mounted, Ordering::Relaxed);
+    }
 }
 
 /// Parámetros compartidos entre la UI/CLI y el callback de audio mediante atómicos.
@@ -157,8 +169,10 @@ impl Params {
                     name: fx.name(),
                     accent_color: fx.accent_color(),
                     specs,
+                    is_master: fx.name() == "Master Volume",
                     values: values.into_boxed_slice(),
                     bypass: AtomicBool::new(*bypass),
+                    mounted: AtomicBool::new(true),
                 });
                 order.push(AtomicUsize::new(idx));
             }
@@ -215,6 +229,39 @@ impl Params {
         let val_b = self.order[pos_b].load(Ordering::Acquire);
         self.order[pos_a].store(val_b, Ordering::Release);
         self.order[pos_b].store(val_a, Ordering::Release);
+    }
+
+    /// Devuelve el slot de volumen maestro fijo (si existe).
+    pub fn master_slot(&self) -> Option<&PedalParamSlot> {
+        self.slots.iter().find(|s| s.is_master)
+    }
+
+    /// Monta un pedal y lo ubica al final de los pedales de efecto (antes del Master Volume).
+    pub fn move_slot_to_end(&self, slot_idx: usize) {
+        if slot_idx >= self.slots.len() || self.slots[slot_idx].is_master {
+            return;
+        }
+        let mut effects: Vec<usize> = Vec::with_capacity(self.order.len());
+        let mut masters: Vec<usize> = Vec::with_capacity(1);
+        for atom in self.order.iter() {
+            let idx = atom.load(Ordering::Acquire);
+            if idx == slot_idx {
+                continue;
+            }
+            if self.slots.get(idx).is_some_and(|s| s.is_master) {
+                masters.push(idx);
+            } else {
+                effects.push(idx);
+            }
+        }
+        effects.push(slot_idx);
+        effects.extend(masters);
+        for (pos, idx) in effects.into_iter().enumerate() {
+            if let Some(atom) = self.order.get(pos) {
+                atom.store(idx, Ordering::Release);
+            }
+        }
+        self.slots[slot_idx].set_mounted(true);
     }
 
     pub fn set_drive_db(&self, db: f32) {
@@ -352,5 +399,29 @@ impl Meters {
             drift_drops: self.drift_drops.load(Ordering::Relaxed),
             stream_errors: self.stream_errors.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn params_mounting_and_master_separation_keep_master_last() {
+        let params = Params::default();
+        assert_eq!(params.slot_count(), 3);
+        assert!(params.master_slot().is_some());
+        assert_eq!(params.master_slot().unwrap().name, "Master Volume");
+        assert!(!params.slots()[0].is_master);
+        assert!(!params.slots()[1].is_master);
+
+        // Desmontar Noise Gate (0) y volverlo a montar al final -> debe quedar antes de Master (2).
+        params.slots()[0].set_mounted(false);
+        assert!(!params.slots()[0].is_mounted());
+        params.move_slot_to_end(0);
+        assert!(params.slots()[0].is_mounted());
+        assert_eq!(params.order_at(0), 1); // Overdrive
+        assert_eq!(params.order_at(1), 0); // Noise Gate
+        assert_eq!(params.order_at(2), 2); // Master Volume siempre al final
     }
 }

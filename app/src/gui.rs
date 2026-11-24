@@ -34,8 +34,8 @@ pub fn run_gui(opts: GuiStartOptions) -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Pedalera Virtual — Guitar FX")
-            .with_inner_size([1120.0, 640.0])
-            .with_min_inner_size([780.0, 500.0]),
+            .with_inner_size([1240.0, 700.0])
+            .with_min_inner_size([840.0, 560.0]),
         ..Default::default()
     };
 
@@ -44,9 +44,16 @@ pub fn run_gui(opts: GuiStartOptions) -> anyhow::Result<()> {
         native_options,
         Box::new(move |cc| {
             let mut visuals = egui::Visuals::dark();
-            visuals.panel_fill = Color32::from_rgb(16, 19, 24);
+            visuals.panel_fill = Color32::from_rgb(15, 18, 23);
             visuals.extreme_bg_color = Color32::from_rgb(10, 12, 16);
             cc.egui_ctx.set_visuals(visuals);
+
+            cc.egui_ctx.global_style_mut(|style| {
+                style.spacing.button_padding = Vec2::new(10.0, 6.0);
+                style.spacing.interact_size = Vec2::new(40.0, 28.0);
+                style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+            });
+
             Ok(Box::new(PedalboardApp::new(opts)))
         }),
     )
@@ -194,7 +201,6 @@ impl PedalboardApp {
     }
 
     fn refresh_devices(&mut self) {
-        // Detener temporalmente si es ASIO antes de re-enumerar, para liberar el driver único.
         #[cfg(feature = "asio")]
         let was_asio = self.selected_host == HostKind::Asio && self.engine.is_some();
         #[cfg(not(feature = "asio"))]
@@ -213,7 +219,6 @@ impl PedalboardApp {
     }
 
     fn start_engine(&mut self) {
-        // Siempre soltar streams previos antes de abrir nuevos (crítico para ASIO).
         self.engine = None;
         self.last_error = None;
 
@@ -264,7 +269,7 @@ impl PedalboardApp {
         if self.engine.is_some() {
             let snap = self.meters.snapshot_and_reset_peaks();
             self.last_snapshot = snap;
-            let decay = 36.0 * dt; // caída visual ~36 dB/s
+            let decay = 36.0 * dt;
             self.smooth_in_db = if snap.input_db > self.smooth_in_db {
                 snap.input_db
             } else {
@@ -281,10 +286,9 @@ impl PedalboardApp {
         }
     }
 
-    /// Devuelve el umbral activo del Noise Gate (para dibujar la marca sobre el vúmetro de entrada).
     fn active_gate_threshold_db(&self) -> Option<f32> {
         for slot in self.params.slots() {
-            if slot.name == "Noise Gate" && !slot.bypass() {
+            if slot.name == "Noise Gate" && slot.is_mounted() && !slot.bypass() {
                 let th = slot.get(0);
                 if th > -100.0 {
                     return Some(th);
@@ -294,183 +298,309 @@ impl PedalboardApp {
         None
     }
 
-    fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
-        let panel_frame = Frame::new()
-            .fill(Color32::from_rgb(22, 26, 34))
+    fn draw_studio_rack(&mut self, ui: &mut egui::Ui) {
+        let rack_frame = Frame::new()
+            .fill(Color32::from_rgb(18, 22, 29))
             .inner_margin(Margin::symmetric(14, 10))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(42, 48, 60)));
+            .stroke(Stroke::new(1.0, Color32::from_rgb(38, 45, 58)));
 
-        egui::Panel::top("audio_header")
-            .frame(panel_frame)
+        egui::Panel::top("studio_rack")
+            .frame(rack_frame)
             .show(ui, |ui| {
-                // Fila 1: Título + controles de dispositivo
-                ui.horizontal_wrapped(|ui| {
-                    ui.heading(
-                        egui::RichText::new("🎸 Pedalera Virtual")
-                            .strong()
-                            .color(Color32::from_rgb(240, 244, 248)),
-                    );
-                    ui.separator();
-
-                    // Selector de Host
-                    ui.label("Host:");
-                    let prev_host = self.selected_host;
-                    egui::ComboBox::from_id_salt("host_select")
-                        .selected_text(self.selected_host.display_name())
-                        .width(90.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.selected_host, HostKind::Wasapi, "WASAPI");
-                            #[cfg(feature = "asio")]
-                            ui.selectable_value(&mut self.selected_host, HostKind::Asio, "ASIO");
-                        });
-                    if self.selected_host != prev_host {
-                        self.selected_input = None;
-                        self.selected_output = None;
-                        self.selected_in_channel = 0;
-                        self.select_defaults_if_missing();
-                        self.start_engine();
-                    }
-
-                    // Selector de Entrada
-                    let in_names = self.input_device_names();
-                    ui.label("Entrada:");
-                    let in_label = self
-                        .selected_input
-                        .as_deref()
-                        .unwrap_or("(sin entrada)");
-                    egui::ComboBox::from_id_salt("in_dev_select")
-                        .selected_text(truncate_label(in_label, 28))
-                        .width(210.0)
-                        .show_ui(ui, |ui| {
-                            for name in &in_names {
-                                ui.selectable_value(
-                                    &mut self.selected_input,
-                                    Some(name.clone()),
-                                    name,
-                                );
-                            }
-                        });
-
-                    #[cfg(feature = "asio")]
-                    if self.selected_host == HostKind::Asio {
-                        self.selected_output = self.selected_input.clone();
-                    }
-
-                    // Selector de Canal de entrada
-                    let max_ch = self.max_input_channels();
-                    if self.selected_in_channel >= max_ch {
-                        self.selected_in_channel = 0;
-                    }
-                    ui.label("Canal:");
-                    egui::ComboBox::from_id_salt("in_ch_select")
-                        .selected_text(format!("Ch {}", self.selected_in_channel))
-                        .width(64.0)
-                        .show_ui(ui, |ui| {
-                            for ch in 0..max_ch {
-                                ui.selectable_value(
-                                    &mut self.selected_in_channel,
-                                    ch,
-                                    format!("Canal {ch}"),
-                                );
-                            }
-                        });
-
-                    // Selector de Salida
-                    let out_names = self.output_device_names();
-                    let is_asio = {
-                        #[cfg(feature = "asio")]
-                        {
-                            self.selected_host == HostKind::Asio
-                        }
-                        #[cfg(not(feature = "asio"))]
-                        {
-                            false
-                        }
-                    };
-                    ui.label("Salida:");
-                    let out_label = truncate_label(
-                        self.selected_output
-                            .as_deref()
-                            .unwrap_or("(sin salida)"),
-                        28,
-                    );
-                    ui.add_enabled_ui(!is_asio, |ui| {
-                        egui::ComboBox::from_id_salt("out_dev_select")
-                            .selected_text(out_label)
-                            .width(210.0)
-                            .show_ui(ui, |ui| {
-                                for name in &out_names {
-                                    ui.selectable_value(
-                                        &mut self.selected_output,
-                                        Some(name.clone()),
-                                        name,
-                                    );
-                                }
-                            });
-                    })
-                    .response
-                    .on_disabled_hover_text("En ASIO la salida usa el mismo driver que la entrada");
-
-                    // Selector de Buffer
-                    ui.label("Buffer:");
-                    let buf_text = self
-                        .selected_buffer
-                        .map_or_else(|| "Auto".to_string(), |b| format!("{b} fr"));
-                    egui::ComboBox::from_id_salt("buf_select")
-                        .selected_text(buf_text)
-                        .width(78.0)
-                        .show_ui(ui, |ui| {
-                            for opt in BUFFER_OPTIONS {
-                                let label = opt.map_or_else(
-                                    || "Auto (Default)".to_string(),
-                                    |b| format!("{b} frames"),
-                                );
-                                ui.selectable_value(&mut self.selected_buffer, opt, label);
-                            }
-                        });
+                ui.columns(3, |cols| {
+                    self.draw_input_rack_block(&mut cols[0]);
+                    self.draw_engine_rack_block(&mut cols[1]);
+                    self.draw_master_output_rack_block(&mut cols[2]);
                 });
+            });
+    }
 
-                ui.add_space(6.0);
+    fn draw_input_rack_block(&mut self, ui: &mut egui::Ui) {
+        solid_rack_frame(Color32::from_rgb(59, 130, 246)).show(ui, |ui| {
+            ui.set_min_height(132.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("🎸 ENTRADA DE AUDIO")
+                        .strong()
+                        .size(13.5)
+                        .color(Color32::from_rgb(96, 165, 250)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    rack_fixed_badge(ui, "FIJO");
+                });
+            });
+            ui.add_space(4.0);
 
-                // Fila 2: Botones de control de motor + Estado + MUTE
-                ui.horizontal_wrapped(|ui| {
-                    let running = self.engine.is_some();
-                    let start_label = if running {
-                        "🔄 Aplicar / Reconectar"
+            let prev_host = self.selected_host;
+            let combo_w = (ui.available_width() - 180.0).clamp(130.0, 250.0);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Host:");
+                egui::ComboBox::from_id_salt("host_select")
+                    .selected_text(self.selected_host.display_name())
+                    .width(82.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.selected_host, HostKind::Wasapi, "WASAPI");
+                        #[cfg(feature = "asio")]
+                        ui.selectable_value(&mut self.selected_host, HostKind::Asio, "ASIO");
+                    });
+
+                ui.label("Buffer:");
+                let buf_text = self
+                    .selected_buffer
+                    .map_or_else(|| "Auto".to_string(), |b| format!("{b} fr"));
+                egui::ComboBox::from_id_salt("buf_select")
+                    .selected_text(buf_text)
+                    .width(78.0)
+                    .show_ui(ui, |ui| {
+                        for opt in BUFFER_OPTIONS {
+                            let label = opt.map_or_else(
+                                || "Auto (Default)".to_string(),
+                                |b| format!("{b} frames"),
+                            );
+                            ui.selectable_value(&mut self.selected_buffer, opt, label);
+                        }
+                    });
+            });
+
+            if self.selected_host != prev_host {
+                self.selected_input = None;
+                self.selected_output = None;
+                self.selected_in_channel = 0;
+                self.select_defaults_if_missing();
+                self.start_engine();
+            }
+
+            let in_names = self.input_device_names();
+            let in_label = truncate_label(
+                self.selected_input.as_deref().unwrap_or("(sin entrada)"),
+                28,
+            );
+            let max_ch = self.max_input_channels();
+            if self.selected_in_channel >= max_ch {
+                self.selected_in_channel = 0;
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Disp:");
+                egui::ComboBox::from_id_salt("in_dev_select")
+                    .selected_text(in_label)
+                    .width(combo_w)
+                    .show_ui(ui, |ui| {
+                        for name in &in_names {
+                            ui.selectable_value(
+                                &mut self.selected_input,
+                                Some(name.clone()),
+                                name,
+                            );
+                        }
+                    });
+
+                egui::ComboBox::from_id_salt("in_ch_select")
+                    .selected_text(format!("Ch {}", self.selected_in_channel))
+                    .width(62.0)
+                    .show_ui(ui, |ui| {
+                        for ch in 0..max_ch {
+                            ui.selectable_value(
+                                &mut self.selected_in_channel,
+                                ch,
+                                format!("Canal {ch}"),
+                            );
+                        }
+                    });
+            });
+
+            #[cfg(feature = "asio")]
+            if self.selected_host == HostKind::Asio {
+                self.selected_output = self.selected_input.clone();
+            }
+
+            ui.add_space(6.0);
+            let gate_th = self.active_gate_threshold_db();
+            draw_level_meter(ui, "IN", self.smooth_in_db, gate_th, false);
+        });
+    }
+
+    fn draw_engine_rack_block(&mut self, ui: &mut egui::Ui) {
+        solid_rack_frame(Color32::from_rgb(100, 116, 139)).show(ui, |ui| {
+            ui.set_min_height(132.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("⚙ MOTOR DE AUDIO")
+                        .strong()
+                        .size(13.5)
+                        .color(Color32::from_rgb(203, 213, 225)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.engine.is_some() {
+                        ui.colored_label(Color32::from_rgb(74, 222, 128), "● EN LÍNEA");
                     } else {
-                        "▶ Iniciar Audio"
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(start_label)
-                                .fill(Color32::from_rgb(34, 110, 72)),
-                        )
-                        .clicked()
-                    {
-                        self.start_engine();
+                        ui.colored_label(Color32::from_rgb(148, 163, 184), "○ DETENIDO");
                     }
+                });
+            });
+            ui.add_space(6.0);
 
-                    if ui
-                        .add_enabled(
-                            running,
-                            egui::Button::new("⏹ Detener")
-                                .fill(Color32::from_rgb(80, 42, 46)),
+            ui.horizontal_wrapped(|ui| {
+                let running = self.engine.is_some();
+                let start_label = if running { "🔄 Reconectar" } else { "▶ Iniciar" };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(start_label)
+                                .strong()
+                                .color(Color32::WHITE),
                         )
-                        .clicked()
-                    {
-                        self.stop_engine();
-                    }
+                        .min_size(Vec2::new(112.0, 30.0))
+                        .fill(Color32::from_rgb(22, 115, 72)),
+                    )
+                    .clicked()
+                {
+                    self.start_engine();
+                }
 
-                    if ui.button("🔍 Refrescar dispositivos").clicked() {
-                        self.refresh_devices();
-                    }
+                if ui
+                    .add_enabled(
+                        running,
+                        egui::Button::new("⏹ Detener")
+                            .min_size(Vec2::new(92.0, 30.0))
+                            .fill(Color32::from_rgb(95, 42, 48)),
+                    )
+                    .clicked()
+                {
+                    self.stop_engine();
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new("🔍 Refrescar")
+                            .min_size(Vec2::new(96.0, 30.0)),
+                    )
+                    .clicked()
+                {
+                    self.refresh_devices();
+                }
+            });
+
+            ui.add_space(6.0);
+
+            if let Some(err) = &self.last_error {
+                ui.colored_label(
+                    Color32::from_rgb(248, 113, 113),
+                    truncate_label(&format!("Error: {err}"), 72),
+                );
+            } else if let Some(eng) = &self.engine {
+                let info = eng.info();
+                let sr_text = format_sample_rate(info);
+                let in_b = info
+                    .input_buffer_frames
+                    .map_or("?".to_string(), |v| v.to_string());
+                let out_b = info
+                    .output_buffer_frames
+                    .map_or("?".to_string(), |v| v.to_string());
+                let xruns = self.last_snapshot.underruns + self.last_snapshot.overflows;
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Frecuencia: {sr_text}  ·  Latencia: {:.1} ms",
+                        info.estimated_latency_ms
+                    ))
+                    .size(12.5)
+                    .color(Color32::from_rgb(226, 232, 240)),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Buffers: {in_b}/{out_b} + ring {} fr  ·  xruns: {xruns} (und:{}, ovf:{}, drift:{})",
+                        info.prefill_frames,
+                        self.last_snapshot.underruns,
+                        self.last_snapshot.overflows,
+                        self.last_snapshot.drift_drops,
+                    ))
+                    .size(11.5)
+                    .color(Color32::from_rgb(148, 163, 184)),
+                );
+            } else {
+                ui.colored_label(
+                    Color32::from_rgb(148, 163, 184),
+                    "Selecciona dispositivos y presiona Iniciar.",
+                );
+            }
+        });
+    }
+
+    fn draw_master_output_rack_block(&mut self, ui: &mut egui::Ui) {
+        solid_rack_frame(Color32::from_rgb(34, 197, 94)).show(ui, |ui| {
+            ui.set_min_height(132.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("🔊 MASTER Y SALIDA")
+                        .strong()
+                        .size(13.5)
+                        .color(Color32::from_rgb(74, 222, 128)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    rack_fixed_badge(ui, "FIJO");
+                });
+            });
+            ui.add_space(4.0);
+
+            let out_names = self.output_device_names();
+            let is_asio = {
+                #[cfg(feature = "asio")]
+                {
+                    self.selected_host == HostKind::Asio
+                }
+                #[cfg(not(feature = "asio"))]
+                {
+                    false
+                }
+            };
+            let out_label = truncate_label(
+                self.selected_output.as_deref().unwrap_or("(sin salida)"),
+                24,
+            );
+
+            ui.horizontal(|ui| {
+                // Izquierda: selector de salida, MUTE y vúmetro OUT
+                ui.vertical(|ui| {
+                    let left_w = (ui.available_width() - 88.0).max(120.0);
+                    ui.set_max_width(left_w);
+
+                    let combo_w = (left_w - 48.0).clamp(90.0, 240.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Disp:");
+                        ui.add_enabled_ui(!is_asio, |ui| {
+                            egui::ComboBox::from_id_salt("out_dev_select")
+                                .selected_text(out_label)
+                                .width(combo_w)
+                                .show_ui(ui, |ui| {
+                                    for name in &out_names {
+                                        ui.selectable_value(
+                                            &mut self.selected_output,
+                                            Some(name.clone()),
+                                            name,
+                                        );
+                                    }
+                                });
+                        })
+                        .response
+                        .on_disabled_hover_text(
+                            "En ASIO la salida usa el mismo driver que la entrada",
+                        );
+                    });
+
+                    ui.add_space(4.0);
 
                     let muted = self.params.mute();
                     let mute_btn = egui::Button::new(
-                        egui::RichText::new(if muted { "🔇 MUTE ACTIVO" } else { "🔊 Salida Activa" })
-                            .strong()
-                            .color(Color32::WHITE),
+                        egui::RichText::new(if muted {
+                            "🔇 MUTE ACTIVO"
+                        } else {
+                            "🔊 Salida Activa"
+                        })
+                        .strong()
+                        .color(Color32::WHITE),
                     )
+                    .min_size(Vec2::new(124.0, 30.0))
                     .fill(if muted {
                         Color32::from_rgb(185, 45, 45)
                     } else {
@@ -480,89 +610,158 @@ impl PedalboardApp {
                         self.params.set_mute(!muted);
                     }
 
-                    ui.separator();
+                    ui.add_space(6.0);
+                    draw_level_meter(ui, "OUT", self.smooth_out_db, None, muted);
+                });
 
-                    if let Some(err) = &self.last_error {
-                        ui.colored_label(Color32::from_rgb(248, 113, 113), format!("Error: {err}"));
-                    } else if let Some(eng) = &self.engine {
-                        let info = eng.info();
-                        let sr_text = format_sample_rate(info);
-                        let in_b = info
-                            .input_buffer_frames
-                            .map_or("?".to_string(), |v| v.to_string());
-                        let out_b = info
-                            .output_buffer_frames
-                            .map_or("?".to_string(), |v| v.to_string());
-                        let xruns = self.last_snapshot.underruns + self.last_snapshot.overflows;
-                        ui.colored_label(
-                            Color32::from_rgb(74, 222, 128),
-                            "● EN LÍNEA",
+                // Derecha: Perilla fija de Master Volume separada de los pedales
+                if let Some(master) = self.params.master_slot() {
+                    if let Some(spec) = master.specs.first() {
+                        let mut val = master.get(0);
+                        let muted = self.params.mute();
+                        let accent = Color32::from_rgb(
+                            master.accent_color[0],
+                            master.accent_color[1],
+                            master.accent_color[2],
                         );
-                        ui.label(format!(
-                            "{sr_text}  |  Buf: {in_b}/{out_b} + ring {} fr  |  Latencia: {:.1} ms  |  xruns: {xruns} (und:{}, ovf:{}, drift:{})",
-                            info.prefill_frames,
-                            info.estimated_latency_ms,
-                            self.last_snapshot.underruns,
-                            self.last_snapshot.overflows,
-                            self.last_snapshot.drift_drops,
-                        ));
-                    } else {
-                        ui.colored_label(Color32::from_rgb(160, 170, 185), "○ Motor detenido");
+                        if draw_rotary_knob(
+                            ui,
+                            spec,
+                            &mut val,
+                            accent,
+                            !muted && !master.bypass(),
+                            0.86,
+                        ) {
+                            master.set(0, val);
+                        }
                     }
-                });
-
-                ui.add_space(6.0);
-
-                // Fila 3: Vúmetros en vivo
-                let gate_th = self.active_gate_threshold_db();
-                let muted = self.params.mute();
-                ui.columns(2, |cols| {
-                    draw_level_meter(
-                        &mut cols[0],
-                        "ENTRADA",
-                        self.smooth_in_db,
-                        gate_th,
-                        false,
-                    );
-                    draw_level_meter(
-                        &mut cols[1],
-                        "SALIDA",
-                        self.smooth_out_db,
-                        None,
-                        muted,
-                    );
-                });
+                }
             });
+        });
     }
 
     fn draw_cascade_board(&mut self, ui: &mut egui::Ui) {
         let central_frame = Frame::new()
-            .fill(Color32::from_rgb(15, 18, 23))
-            .inner_margin(Margin::same(16));
+            .fill(Color32::from_rgb(13, 16, 21))
+            .inner_margin(Margin::symmetric(16, 12));
 
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                // Posiciones de cascada de los pedales de efecto (excluye Master Volume)
+                let mut mounted_positions: Vec<usize> = Vec::new();
+                let mut unmounted_slots: Vec<(usize, &'static str, [u8; 3])> = Vec::new();
+
+                for pos in 0..self.params.slot_count() {
+                    let slot_idx = self.params.order_at(pos);
+                    if let Some(slot) = self.params.slots().get(slot_idx) {
+                        if !slot.is_master && slot.is_mounted() {
+                            mounted_positions.push(pos);
+                        }
+                    }
+                }
+                for (slot_idx, slot) in self.params.slots().iter().enumerate() {
+                    if !slot.is_master && !slot.is_mounted() {
+                        unmounted_slots.push((slot_idx, slot.name, slot.accent_color));
+                    }
+                }
+
+                // Barra de herramientas de la pedalera + menú Añadir / Quitar
+                ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        egui::RichText::new("CASCADA DE EFECTOS")
+                        egui::RichText::new("PEDALERA EN CASCADA")
                             .strong()
-                            .size(15.0)
-                            .color(Color32::from_rgb(203, 213, 225)),
+                            .size(15.5)
+                            .color(Color32::from_rgb(226, 232, 240)),
                     );
-                    ui.add_space(12.0);
+
                     ui.label(
-                        egui::RichText::new(
-                            "Arrastra las perillas arriba/abajo o usa la rueda · Shift = ajuste fino · Doble clic = valor inicial",
-                        )
-                        .size(12.0)
-                        .color(Color32::from_rgb(120, 134, 152)),
+                        egui::RichText::new(format!("({} en cadena)", mounted_positions.len()))
+                            .size(13.0)
+                            .color(Color32::from_rgb(148, 163, 184)),
                     );
+
+                    ui.add_space(6.0);
+
+                    ui.menu_button(
+                        egui::RichText::new("➕ Añadir / Quitar Pedales ▾")
+                            .strong()
+                            .size(13.5),
+                        |ui| {
+                            ui.set_min_width(240.0);
+                            ui.label(
+                                egui::RichText::new("Pedales disponibles")
+                                    .strong()
+                                    .color(Color32::from_rgb(180, 192, 210)),
+                            );
+                            ui.separator();
+
+                            for (slot_idx, slot) in self.params.slots().iter().enumerate() {
+                                if slot.is_master {
+                                    continue;
+                                }
+                                let mut mounted = slot.is_mounted();
+                                let [r, g, b] = slot.accent_color;
+                                let label = if mounted {
+                                    format!("✓  {}  (En pedalera)", slot.name)
+                                } else {
+                                    format!("➕  {}  (Añadir)", slot.name)
+                                };
+                                let resp = ui.checkbox(&mut mounted, egui::RichText::new(label).color(Color32::from_rgb(r, g, b)));
+                                if resp.changed() {
+                                    if mounted {
+                                        self.params.move_slot_to_end(slot_idx);
+                                    } else {
+                                        slot.set_mounted(false);
+                                    }
+                                }
+                            }
+                        },
+                    );
+
+                    // Botones rápidos de 1 clic para volver a poner pedales quitados
+                    for (slot_idx, name, [r, g, b]) in &unmounted_slots {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("+ {name}"))
+                                        .strong()
+                                        .color(Color32::from_rgb(*r, *g, *b)),
+                                )
+                                .min_size(Vec2::new(110.0, 28.0)),
+                            )
+                            .on_hover_text(format!("Añadir {name} al final de la cascada"))
+                            .clicked()
+                        {
+                            self.params.move_slot_to_end(*slot_idx);
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Arrastra perillas ↑↓ o rueda · Shift = fino · Doble clic = reset",
+                            )
+                            .size(12.0)
+                            .color(Color32::from_rgb(120, 134, 152)),
+                        );
+                    });
                 });
 
-                ui.add_space(12.0);
+                ui.add_space(10.0);
 
-                let slot_count = self.params.slot_count();
+                // Cálculo responsivo pensado para 5-6 pedales sin scroll en 1920x1080
+                // y sin apretarse cuando la ventana es pequeña (mínimo 245 px de ancho por pedal).
+                let avail_h = ui.available_height();
+                let avail_w = ui.available_width();
+                let pedal_height = (avail_h - 28.0).clamp(320.0, 460.0);
+                let pedal_width = if avail_w >= 1750.0 {
+                    256.0
+                } else {
+                    248.0
+                };
+                let knob_scale = (pedal_height / 375.0).clamp(0.88, 1.15);
+
                 let in_label = self
                     .selected_input
                     .as_deref()
@@ -576,48 +775,112 @@ impl PedalboardApp {
                 let in_ch = self.selected_in_channel;
                 let muted = self.params.mute();
                 let active = self.engine.is_some();
+                let master_db = self.params.master_slot().map_or(-6.0, |m| m.get(0));
+                let sample_rate_label = self.engine.as_ref().map(|e| {
+                    let i = e.info();
+                    if i.input_sample_rate != i.output_sample_rate {
+                        format!("{}→{} Hz", i.input_sample_rate, i.output_sample_rate)
+                    } else {
+                        format!("{} Hz", i.sample_rate)
+                    }
+                });
 
                 egui::ScrollArea::horizontal()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
-                            ui.spacing_mut().item_spacing.x = 10.0;
+                            ui.spacing_mut().item_spacing.x = 8.0;
 
-                            draw_endpoint_card(
+                            draw_fixed_terminal(
                                 ui,
-                                "🎸 ENTRADA",
-                                &truncate_label(&in_label, 22),
-                                &format!("Canal {in_ch}"),
+                                "🎸 IN",
+                                &truncate_label(&in_label, 14),
+                                &format!(
+                                    "Canal {in_ch}{}",
+                                    sample_rate_label
+                                        .as_deref()
+                                        .map_or(String::new(), |s| format!("\n{s}"))
+                                ),
                                 Color32::from_rgb(59, 130, 246),
+                                pedal_height,
                                 active,
                             );
 
                             draw_signal_arrow(ui, active);
 
-                            for cascade_pos in 0..slot_count {
-                                let slot_idx = self.params.order_at(cascade_pos);
-                                if let Some(slot) = self.params.slots().get(slot_idx) {
-                                    draw_stompbox_pedal(
-                                        ui,
-                                        &self.params,
-                                        cascade_pos,
-                                        slot_count,
-                                        slot,
-                                    );
-                                }
+                            if mounted_positions.is_empty() {
+                                Frame::new()
+                                    .fill(Color32::from_rgb(20, 24, 31))
+                                    .corner_radius(CornerRadius::same(10))
+                                    .stroke(Stroke::new(1.5, Color32::from_rgb(48, 56, 70)))
+                                    .inner_margin(Margin::same(24))
+                                    .show(ui, |ui| {
+                                        ui.set_min_size(Vec2::new(300.0, pedal_height));
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_space(pedal_height * 0.3);
+                                            ui.label(
+                                                egui::RichText::new("Sin pedales en la cadena")
+                                                    .strong()
+                                                    .size(16.0)
+                                                    .color(Color32::from_rgb(180, 192, 208)),
+                                            );
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Señal directa hacia Master Volume. Usa 'Añadir Pedales' arriba.",
+                                                )
+                                                .color(Color32::from_rgb(125, 138, 156)),
+                                            );
+                                        });
+                                    });
                                 draw_signal_arrow(ui, active && !muted);
+                            } else {
+                                let mounted_len = mounted_positions.len();
+                                for (m_idx, &cascade_pos) in mounted_positions.iter().enumerate() {
+                                    let slot_idx = self.params.order_at(cascade_pos);
+                                    if let Some(slot) = self.params.slots().get(slot_idx) {
+                                        let prev_pos = if m_idx > 0 {
+                                            Some(mounted_positions[m_idx - 1])
+                                        } else {
+                                            None
+                                        };
+                                        let next_pos = if m_idx + 1 < mounted_len {
+                                            Some(mounted_positions[m_idx + 1])
+                                        } else {
+                                            None
+                                        };
+                                        draw_stompbox_pedal(
+                                            ui,
+                                            &self.params,
+                                            m_idx,
+                                            cascade_pos,
+                                            prev_pos,
+                                            next_pos,
+                                            slot,
+                                            pedal_width,
+                                            pedal_height,
+                                            knob_scale,
+                                        );
+                                    }
+                                    draw_signal_arrow(ui, active && !muted);
+                                }
                             }
 
-                            draw_endpoint_card(
+                            draw_fixed_terminal(
                                 ui,
-                                if muted { "🔇 SALIDA (MUTE)" } else { "🔊 SALIDA" },
-                                &truncate_label(&out_label, 22),
-                                if muted { "Silenciada" } else { "Estéreo" },
+                                if muted { "🔇 MUTE" } else { "🔊 MASTER" },
+                                &truncate_label(&out_label, 14),
+                                &if muted {
+                                    "Silenciada".to_string()
+                                } else {
+                                    format!("Vol: {master_db:.1} dB")
+                                },
                                 if muted {
                                     Color32::from_rgb(220, 38, 38)
                                 } else {
                                     Color32::from_rgb(34, 197, 94)
                                 },
+                                pedal_height,
                                 active && !muted,
                             );
                         });
@@ -629,11 +892,37 @@ impl PedalboardApp {
 impl eframe::App for PedalboardApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.update_meters();
-        self.draw_top_bar(ui);
+        self.draw_studio_rack(ui);
         self.draw_cascade_board(ui);
         ui.ctx()
             .request_repaint_after(Duration::from_millis(33));
     }
+}
+
+fn solid_rack_frame(accent: Color32) -> Frame {
+    Frame::new()
+        .fill(Color32::from_rgb(23, 28, 37))
+        .corner_radius(CornerRadius::same(8))
+        .stroke(Stroke::new(
+            1.2,
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 110),
+        ))
+        .inner_margin(Margin::same(10))
+}
+
+fn rack_fixed_badge(ui: &mut egui::Ui, text: &str) {
+    Frame::new()
+        .fill(Color32::from_rgb(35, 42, 54))
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .size(10.5)
+                    .strong()
+                    .color(Color32::from_rgb(165, 178, 196)),
+            );
+        });
 }
 
 fn format_sample_rate(info: &EngineInfo) -> String {
@@ -670,12 +959,12 @@ fn draw_level_meter(
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(title)
-                .small()
+                .size(11.5)
                 .strong()
                 .color(Color32::from_rgb(175, 185, 200)),
         );
 
-        let desired = Vec2::new((ui.available_width() - 88.0).max(120.0), 16.0);
+        let desired = Vec2::new((ui.available_width() - 78.0).max(80.0), 15.0);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         let p = ui.painter();
 
@@ -708,7 +997,6 @@ fn draw_level_meter(
             p.rect_filled(fill_rect, CornerRadius::same(2), bar_color);
         }
 
-        // Marca visual del umbral del Noise Gate
         if let Some(th_db) = marker_db {
             let th_norm = ((th_db - MIN_DB) / (MAX_DB - MIN_DB)).clamp(0.0, 1.0);
             let x = rect.min.x + 2.0 + (rect.width() - 4.0) * th_norm;
@@ -729,40 +1017,42 @@ fn draw_level_meter(
     });
 }
 
-fn draw_endpoint_card(
+fn draw_fixed_terminal(
     ui: &mut egui::Ui,
     title: &str,
-    subtitle: &str,
+    device_name: &str,
     detail: &str,
     accent: Color32,
+    height: f32,
     active: bool,
 ) {
     let border = if active {
-        accent
+        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 160)
     } else {
-        Color32::from_rgb(58, 65, 78)
+        Color32::from_rgb(52, 58, 70)
     };
     Frame::new()
-        .fill(Color32::from_rgb(24, 28, 36))
-        .corner_radius(CornerRadius::same(10))
+        .fill(Color32::from_rgb(18, 21, 27))
+        .corner_radius(CornerRadius::same(8))
         .stroke(Stroke::new(1.5, border))
-        .inner_margin(Margin::same(12))
+        .inner_margin(Margin::same(10))
         .show(ui, |ui| {
-            ui.set_min_size(Vec2::new(135.0, 260.0));
-            ui.set_max_width(155.0);
+            ui.set_min_size(Vec2::new(96.0, height));
+            ui.set_max_size(Vec2::new(108.0, height));
             ui.vertical_centered(|ui| {
-                ui.add_space(16.0);
-                ui.label(egui::RichText::new(title).strong().size(13.0).color(accent));
-                ui.add_space(14.0);
+                rack_fixed_badge(ui, "CHASSIS");
+                ui.add_space((height * 0.22).max(20.0));
+                ui.label(egui::RichText::new(title).strong().size(13.5).color(accent));
+                ui.add_space(10.0);
                 ui.label(
-                    egui::RichText::new(subtitle)
-                        .size(12.0)
-                        .color(Color32::from_rgb(220, 226, 236)),
+                    egui::RichText::new(device_name)
+                        .size(11.5)
+                        .color(Color32::from_rgb(210, 218, 230)),
                 );
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(detail)
-                        .small()
+                        .size(11.0)
                         .color(Color32::from_rgb(138, 150, 168)),
                 );
             });
@@ -770,7 +1060,7 @@ fn draw_endpoint_card(
 }
 
 fn draw_signal_arrow(ui: &mut egui::Ui, active: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(26.0, 40.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(20.0, 40.0), Sense::hover());
     let color = if active {
         Color32::from_rgb(148, 163, 184)
     } else {
@@ -779,39 +1069,42 @@ fn draw_signal_arrow(ui: &mut egui::Ui, active: bool) {
     let y = rect.center().y;
     let p = ui.painter();
     p.line_segment(
-        [Pos2::new(rect.min.x + 2.0, y), Pos2::new(rect.max.x - 4.0, y)],
+        [Pos2::new(rect.min.x + 1.0, y), Pos2::new(rect.max.x - 3.0, y)],
         Stroke::new(2.5, color),
     );
     p.line_segment(
         [
-            Pos2::new(rect.max.x - 10.0, y - 5.0),
-            Pos2::new(rect.max.x - 3.0, y),
+            Pos2::new(rect.max.x - 9.0, y - 5.0),
+            Pos2::new(rect.max.x - 2.0, y),
         ],
         Stroke::new(2.5, color),
     );
     p.line_segment(
         [
-            Pos2::new(rect.max.x - 10.0, y + 5.0),
-            Pos2::new(rect.max.x - 3.0, y),
+            Pos2::new(rect.max.x - 9.0, y + 5.0),
+            Pos2::new(rect.max.x - 2.0, y),
         ],
         Stroke::new(2.5, color),
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_stompbox_pedal(
     ui: &mut egui::Ui,
     params: &Params,
+    mounted_idx: usize,
     cascade_pos: usize,
-    slot_count: usize,
+    prev_pos: Option<usize>,
+    next_pos: Option<usize>,
     slot: &PedalParamSlot,
+    pedal_width: f32,
+    pedal_height: f32,
+    knob_scale: f32,
 ) {
     let [r, g, b] = slot.accent_color;
     let accent = Color32::from_rgb(r, g, b);
     let bypass = slot.bypass();
     let active = !bypass;
-
-    let knob_count = slot.param_count().max(1);
-    let pedal_width = (108.0 + (knob_count as f32) * 86.0).max(185.0);
 
     let border_color = if active {
         accent
@@ -828,51 +1121,73 @@ fn draw_stompbox_pedal(
         .fill(bg_color)
         .corner_radius(CornerRadius::same(12))
         .stroke(Stroke::new(2.0, border_color))
-        .inner_margin(Margin::same(14))
+        .inner_margin(Margin::same(12))
         .show(ui, |ui| {
-            ui.set_min_size(Vec2::new(pedal_width, 280.0));
-            ui.set_max_width(pedal_width);
+            ui.set_min_size(Vec2::new(pedal_width, pedal_height));
+            ui.set_max_size(Vec2::new(pedal_width, pedal_height));
 
-            // Cabecera del pedal: posición en cascada, botones de orden y LED
+            // Cabecera del pedal: posición, reordenar, LED y botón Quitar (✕)
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(format!("#{}", cascade_pos + 1))
-                        .small()
+                    egui::RichText::new(format!("#{}", mounted_idx + 1))
+                        .size(13.0)
                         .strong()
-                        .color(Color32::from_rgb(148, 163, 184)),
+                        .color(Color32::from_rgb(160, 174, 192)),
                 );
 
                 if ui
-                    .add_enabled(cascade_pos > 0, egui::Button::new("◀").small())
+                    .add_enabled(
+                        prev_pos.is_some(),
+                        egui::Button::new("◀").min_size(Vec2::new(28.0, 26.0)),
+                    )
                     .on_hover_text("Mover pedal antes en la cascada")
                     .clicked()
                 {
-                    params.swap_cascade_positions(cascade_pos, cascade_pos - 1);
+                    if let Some(p) = prev_pos {
+                        params.swap_cascade_positions(cascade_pos, p);
+                    }
                 }
 
                 if ui
-                    .add_enabled(cascade_pos + 1 < slot_count, egui::Button::new("▶").small())
+                    .add_enabled(
+                        next_pos.is_some(),
+                        egui::Button::new("▶").min_size(Vec2::new(28.0, 26.0)),
+                    )
                     .on_hover_text("Mover pedal después en la cascada")
                     .clicked()
                 {
-                    params.swap_cascade_positions(cascade_pos, cascade_pos + 1);
+                    if let Some(n) = next_pos {
+                        params.swap_cascade_positions(cascade_pos, n);
+                    }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (led_rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("✕")
+                                    .strong()
+                                    .color(Color32::from_rgb(220, 140, 140)),
+                            )
+                            .min_size(Vec2::new(28.0, 26.0))
+                            .fill(Color32::from_rgb(48, 36, 42)),
+                        )
+                        .on_hover_text("Quitar este pedal de la pedalera")
+                        .clicked()
+                    {
+                        slot.set_mounted(false);
+                    }
+
+                    let (led_rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
                     let c = led_rect.center();
                     let p = ui.painter();
                     if active {
-                        p.circle_filled(
-                            c,
-                            8.0,
-                            Color32::from_rgba_unmultiplied(r, g, b, 65),
-                        );
-                        p.circle_filled(c, 5.0, accent);
+                        p.circle_filled(c, 9.0, Color32::from_rgba_unmultiplied(r, g, b, 65));
+                        p.circle_filled(c, 5.5, accent);
                     } else {
                         p.circle(
                             c,
-                            5.0,
+                            5.5,
                             Color32::from_rgb(45, 50, 58),
                             Stroke::new(1.0, Color32::from_rgb(75, 82, 95)),
                         );
@@ -885,7 +1200,7 @@ fn draw_stompbox_pedal(
                 ui.label(
                     egui::RichText::new(slot.name.to_uppercase())
                         .strong()
-                        .size(15.0)
+                        .size(16.0)
                         .color(if active {
                             Color32::from_rgb(241, 245, 249)
                         } else {
@@ -894,23 +1209,51 @@ fn draw_stompbox_pedal(
                 );
             });
 
-            ui.add_space(12.0);
+            // Zona central de perillas: distribuida en filas de hasta 2 perillas
+            let knob_count = slot.param_count();
+            let row_count = knob_count.div_ceil(2).max(1);
+            let single_knob_scale = if knob_count <= 2 {
+                (knob_scale * 1.12).min(1.22)
+            } else {
+                knob_scale * 0.94
+            };
+            let knob_h = 104.0 * single_knob_scale;
+            let row_gap = 6.0;
+            let knobs_total_h =
+                row_count as f32 * (knob_h + row_gap);
+            let footer_reserve = 78.0;
+            let content_h = (pedal_height - 24.0 - 54.0).max(200.0);
+            let extra_space = ((content_h - knobs_total_h - footer_reserve) * 0.42).max(6.0);
 
-            // Fila automática de perillas según los metadatos del pedal
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                for p_idx in 0..slot.param_count() {
-                    let spec = &slot.specs[p_idx];
-                    let mut val = slot.get(p_idx);
-                    if draw_rotary_knob(ui, spec, &mut val, accent, active) {
-                        slot.set(p_idx, val);
+            ui.add_space(extra_space);
+
+            let indices: Vec<usize> = (0..knob_count).collect();
+            for row in indices.chunks(2) {
+                let knob_w = 88.0 * single_knob_scale;
+                let row_w = row.len() as f32 * knob_w + (row.len().saturating_sub(1) as f32) * 14.0;
+                let side_pad = ((pedal_width - 24.0 - row_w) * 0.5).max(0.0);
+
+                ui.horizontal(|ui| {
+                    if side_pad > 0.0 {
+                        ui.add_space(side_pad);
                     }
-                }
-            });
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    for &p_idx in row {
+                        let spec = &slot.specs[p_idx];
+                        let mut val = slot.get(p_idx);
+                        if draw_rotary_knob(ui, spec, &mut val, accent, active, single_knob_scale) {
+                            slot.set(p_idx, val);
+                        }
+                    }
+                });
+                ui.add_space(row_gap);
+            }
 
-            ui.add_space(16.0);
+            // Empuja el footswitch hacia la base del pedal de manera uniforme
+            let bottom_pad = (content_h - extra_space - knobs_total_h - footer_reserve).max(6.0);
+            ui.add_space(bottom_pad);
 
-            // Zona inferior: Footswitch + Reset
+            // Zona inferior: Footswitch + Reset con tamaño cómodo
             ui.vertical_centered(|ui| {
                 let switch_text = if active { "● ACTIVO" } else { "○ BYPASS" };
                 let switch_fill = if active {
@@ -921,11 +1264,11 @@ fn draw_stompbox_pedal(
                 let switch_btn = egui::Button::new(
                     egui::RichText::new(switch_text)
                         .strong()
-                        .size(13.0)
+                        .size(14.0)
                         .color(Color32::WHITE),
                 )
-                .min_size(Vec2::new(124.0, 34.0))
-                .corner_radius(CornerRadius::same(18))
+                .min_size(Vec2::new(150.0, 38.0))
+                .corner_radius(CornerRadius::same(19))
                 .fill(switch_fill);
 
                 if ui.add(switch_btn).clicked() {
@@ -934,7 +1277,7 @@ fn draw_stompbox_pedal(
 
                 ui.add_space(6.0);
                 if ui
-                    .add(egui::Button::new("↺ Reset").small())
+                    .add(egui::Button::new("↺ Reset").min_size(Vec2::new(82.0, 26.0)))
                     .on_hover_text("Restaurar valores por defecto de este pedal")
                     .clicked()
                 {
@@ -950,8 +1293,9 @@ fn draw_rotary_knob(
     value: &mut f32,
     accent: Color32,
     enabled: bool,
+    scale: f32,
 ) -> bool {
-    let desired_size = Vec2::new(78.0, 106.0);
+    let desired_size = Vec2::new(88.0 * scale, 104.0 * scale);
     let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click_and_drag());
 
     let mut changed = false;
@@ -989,29 +1333,27 @@ fn draw_rotary_knob(
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         let norm = spec.to_normalized(*value);
-        let center = Pos2::new(rect.center().x, rect.min.y + 52.0);
-        let outer_radius = 27.0_f32;
-        let body_radius = 20.0_f32;
+        let center = Pos2::new(rect.center().x, rect.min.y + 52.0 * scale);
+        let outer_radius = 27.0 * scale;
+        let body_radius = 20.0 * scale;
 
-        // Nombre del parámetro arriba
         let title_color = if enabled {
             Color32::from_rgb(203, 213, 225)
         } else {
             Color32::from_rgb(115, 125, 140)
         };
         p.text(
-            Pos2::new(rect.center().x, rect.min.y + 10.0),
+            Pos2::new(rect.center().x, rect.min.y + 11.0 * scale),
             Align2::CENTER_CENTER,
             spec.name,
-            FontId::proportional(12.5),
+            FontId::proportional(13.0 * scale.min(1.1)),
             title_color,
         );
 
-        let start_angle = -0.75 * std::f32::consts::PI; // -135° desde las 12 en punto
-        let sweep = 1.5 * std::f32::consts::PI; // 270° totales
+        let start_angle = -0.75 * std::f32::consts::PI;
+        let sweep = 1.5 * std::f32::consts::PI;
         let active_angle = start_angle + norm * sweep;
 
-        // Arco de fondo
         let bg_points: Vec<Pos2> = (0..=28)
             .map(|i| {
                 let t = i as f32 / 28.0;
@@ -1019,9 +1361,8 @@ fn draw_rotary_knob(
                 center + Vec2::new(a.sin(), -a.cos()) * outer_radius
             })
             .collect();
-        p.line(bg_points, Stroke::new(3.5, Color32::from_rgb(48, 55, 68)));
+        p.line(bg_points, Stroke::new(3.5 * scale.min(1.15), Color32::from_rgb(48, 55, 68)));
 
-        // Arco activo
         let active_steps = ((norm * 28.0).ceil() as usize).max(1);
         if norm > 0.005 {
             let active_points: Vec<Pos2> = (0..=active_steps)
@@ -1036,10 +1377,9 @@ fn draw_rotary_knob(
             } else {
                 Color32::from_rgb(95, 105, 120)
             };
-            p.line(active_points, Stroke::new(3.5, arc_color));
+            p.line(active_points, Stroke::new(3.5 * scale.min(1.15), arc_color));
         }
 
-        // Cuerpo de la perilla
         let body_fill = if response.hovered() || response.dragged() {
             Color32::from_rgb(46, 52, 64)
         } else {
@@ -1052,7 +1392,6 @@ fn draw_rotary_knob(
             Stroke::new(1.5, Color32::from_rgb(78, 88, 104)),
         );
 
-        // Indicador / puntero de la perilla
         let dir = Vec2::new(active_angle.sin(), -active_angle.cos());
         let pointer_color = if enabled {
             Color32::WHITE
@@ -1060,16 +1399,15 @@ fn draw_rotary_knob(
             Color32::from_rgb(140, 148, 160)
         };
         p.line_segment(
-            [center + dir * 5.0, center + dir * (body_radius - 3.0)],
-            Stroke::new(2.5, pointer_color),
+            [center + dir * (5.0 * scale), center + dir * (body_radius - 3.0)],
+            Stroke::new(2.5 * scale.min(1.1), pointer_color),
         );
 
-        // Valor formateado debajo
         p.text(
-            Pos2::new(rect.center().x, rect.max.y - 12.0),
+            Pos2::new(rect.center().x, rect.max.y - 12.0 * scale),
             Align2::CENTER_CENTER,
             spec.format_value(*value),
-            FontId::monospace(11.5),
+            FontId::monospace(12.0 * scale.min(1.1)),
             if enabled {
                 Color32::from_rgb(226, 232, 240)
             } else {
