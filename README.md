@@ -48,6 +48,14 @@ cargo test --workspace
 
 ## Ejemplos de uso
 
+Abrir la interfaz gráfica (cascada de pedales con perillas en vivo):
+
+```powershell
+.\target\release\pedalera.exe
+# o explícitamente:
+.\target\release\pedalera.exe gui
+```
+
 Listar todos los dispositivos y drivers detectados:
 
 ```powershell

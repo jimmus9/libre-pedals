@@ -1,4 +1,14 @@
-use crate::{db_to_lin, sanitize_sample, Effect};
+use crate::{db_to_lin, sanitize_sample, Effect, ParamScale, ParamSpec};
+
+const GATE_PARAMS: [ParamSpec; 1] = [ParamSpec {
+    name: "Threshold",
+    unit: "dB",
+    min: -100.0,
+    max: 0.0,
+    default: -60.0,
+    scale: ParamScale::Linear,
+    decimals: 1,
+}];
 
 /// Puerta de ruido con seguidor de envolvente de pico, hold y suavizado de ganancia.
 #[derive(Debug, Clone)]
@@ -53,6 +63,31 @@ impl NoiseGate {
 }
 
 impl Effect for NoiseGate {
+    fn name(&self) -> &'static str {
+        "Noise Gate"
+    }
+
+    fn accent_color(&self) -> [u8; 3] {
+        [56, 189, 248]
+    }
+
+    fn params(&self) -> &'static [ParamSpec] {
+        &GATE_PARAMS
+    }
+
+    fn get_param(&self, index: usize) -> f32 {
+        match index {
+            0 => self.threshold_db(),
+            _ => 0.0,
+        }
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        if index == 0 {
+            self.set_threshold_db(value);
+        }
+    }
+
     fn prepare(&mut self, sample_rate: f32, _max_block: usize) {
         let sr = sample_rate.max(1.0);
         self.sample_rate = sr;

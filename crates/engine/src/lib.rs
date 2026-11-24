@@ -12,13 +12,13 @@ use cpal::{
     BufferSize, Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
     SupportedBufferSize, SupportedStreamConfig,
 };
-use dsp::{Chain, Effect, Gain, NoiseGate, Overdrive};
+use dsp::{Chain, Effect, Gain, NoiseGate, Overdrive, Resampler};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 pub use devices::{list_devices, ConfigSummary, DeviceReport, HostKind, HostReport};
-pub use params::{InitialParams, MeterSnapshot, Meters, Params};
+pub use params::{InitialParams, MeterSnapshot, Meters, Params, PedalParamSlot};
 
-const SCRATCH_FRAMES: usize = 4096;
+const SCRATCH_FRAMES: usize = 8192;
 
 /// Parámetros de arranque del motor de audio.
 pub struct EngineConfig {
@@ -39,6 +39,8 @@ pub struct EngineInfo {
     pub input_device: String,
     pub output_device: String,
     pub sample_rate: u32,
+    pub input_sample_rate: u32,
+    pub output_sample_rate: u32,
     pub input_channels: u16,
     pub output_channels: u16,
     pub input_channel_used: usize,
@@ -89,7 +91,8 @@ impl Engine {
             &out_default,
         )?;
 
-        let sample_rate = out_supported.sample_rate();
+        let in_sample_rate = in_supported.sample_rate();
+        let out_sample_rate = out_supported.sample_rate();
         let in_channels = in_supported.channels();
         let out_channels = out_supported.channels();
 
@@ -116,10 +119,10 @@ impl Engine {
 
         let prefill_frames = cfg.latency_frames.unwrap_or_else(|| match nominal_buf {
             Some(b) if b > 0 => b.saturating_mul(2),
-            _ => 512,
+            _ => 512_u32.saturating_mul((out_sample_rate / 48_000).max(1)),
         });
 
-        let ring_capacity = (prefill_frames as usize).saturating_mul(8).max(16_384);
+        let ring_capacity = (prefill_frames as usize).saturating_mul(8).max(32_768);
         let drift_control = matches!(cfg.host, HostKind::Wasapi);
         let initial_drift_buf = nominal_buf.unwrap_or(256);
         let max_ring_fill = Arc::new(AtomicU32::new(
@@ -166,14 +169,18 @@ impl Engine {
 
         let in_lat_frames = input_buffer_frames.or(cfg.buffer_frames).unwrap_or(0);
         let out_lat_frames = output_buffer_frames.or(cfg.buffer_frames).unwrap_or(0);
-        let estimated_latency_ms =
-            (in_lat_frames + out_lat_frames + prefill_frames) as f32 * 1_000.0 / sample_rate as f32;
+        let in_lat_ms = in_lat_frames as f32 * 1_000.0 / in_sample_rate as f32;
+        let out_lat_ms =
+            (out_lat_frames + prefill_frames) as f32 * 1_000.0 / out_sample_rate as f32;
+        let estimated_latency_ms = in_lat_ms + out_lat_ms;
 
         let info = EngineInfo {
             host: cfg.host,
             input_device: in_name,
             output_device: out_name,
-            sample_rate,
+            sample_rate: out_sample_rate,
+            input_sample_rate: in_sample_rate,
+            output_sample_rate: out_sample_rate,
             input_channels: in_channels,
             output_channels: out_channels,
             input_channel_used: cfg.input_channel,
@@ -222,6 +229,7 @@ fn build_stream_pair_with_fallback(
             in_dev,
             in_cfg,
             in_supported.sample_format(),
+            out_supported.sample_rate(),
             input_channel,
             producer,
             Arc::clone(meters),
@@ -310,15 +318,11 @@ fn resolve_common_configs(
         {
             return Ok((in_cfg, *out_default));
         }
-        bail!(
-            "Frecuencia de muestreo incompatible sin resampling (v1): salida '{}' usa {} Hz, \
-             pero entrada '{}' usa {} Hz por defecto y no soporta {} Hz.",
-            out_name,
-            target_sr,
-            in_name,
-            in_default.sample_rate(),
-            target_sr
-        );
+        // Si la entrada no soporta la frecuencia de salida de forma nativa, usamos sus
+        // frecuencias nativas y el Resampler cúbico convierte en tiempo real.
+        if in_default.sample_rate() > 0 {
+            return Ok((*in_default, *out_default));
+        }
     }
 
     // Algunos drivers ASIO devuelven 0 Hz antes de abrir el stream; probamos frecuencias estándar.
@@ -332,7 +336,7 @@ fn resolve_common_configs(
     }
 
     Err(anyhow!(
-        "No se encontró una frecuencia de muestreo común entre '{}' y '{}'.",
+        "No se encontró una frecuencia de muestreo válida entre '{}' y '{}'.",
         in_name,
         out_name
     ))
@@ -373,40 +377,32 @@ where
     best
 }
 
-fn build_pedalboard_chain(params: &Params) -> Chain {
+/// Crea la cadena de pedales por defecto. Para agregar nuevos efectos en el futuro
+/// basta con empujarlos aquí; la UI y los parámetros atómicos se generan automáticamente.
+pub fn default_pedalboard_chain() -> Chain {
     let mut chain = Chain::new();
+    chain.push(NoiseGate::new(-60.0), false);
+    chain.push(Overdrive::new(), false);
+    chain.push(Gain::new(-6.0), false);
+    chain
+}
 
-    let gate = NoiseGate::new(params.gate_threshold_db());
-    chain.push(gate, params.bypass_gate());
-
-    let mut od = Overdrive::new();
-    od.set_drive_db(params.drive_db());
-    od.set_tone_hz(params.tone_hz());
-    od.set_level_db(params.level_db());
-    chain.push(od, params.bypass_drive());
-
-    let vol = Gain::new(params.volume_db());
-    chain.push(vol, params.bypass_volume());
-
+fn build_pedalboard_chain(params: &Params) -> Chain {
+    let mut chain = default_pedalboard_chain();
+    sync_chain_from_params(&mut chain, params);
     chain
 }
 
 #[inline]
 fn sync_chain_from_params(chain: &mut Chain, params: &Params) {
-    chain.set_bypass(0, params.bypass_gate());
-    chain.set_bypass(1, params.bypass_drive());
-    chain.set_bypass(2, params.bypass_volume());
-
-    if let Some(gate) = chain.effect_mut::<NoiseGate>(0) {
-        gate.set_threshold_db(params.gate_threshold_db());
-    }
-    if let Some(od) = chain.effect_mut::<Overdrive>(1) {
-        od.set_drive_db(params.drive_db());
-        od.set_tone_hz(params.tone_hz());
-        od.set_level_db(params.level_db());
-    }
-    if let Some(vol) = chain.effect_mut::<Gain>(2) {
-        vol.set_db(params.volume_db());
+    chain.sync_order_from(|pos| params.order_at(pos));
+    for (slot_idx, slot_params) in params.slots().iter().enumerate() {
+        if let Some((fx, bypass)) = chain.slot_mut(slot_idx) {
+            *bypass = slot_params.bypass();
+            for p_idx in 0..slot_params.param_count() {
+                fx.set_param(p_idx, slot_params.get(p_idx));
+            }
+        }
     }
 }
 
@@ -414,16 +410,27 @@ fn build_input_for_format(
     dev: &Device,
     config: StreamConfig,
     format: SampleFormat,
+    out_sample_rate: u32,
     input_channel: usize,
     producer: Producer<f32>,
     meters: Arc<Meters>,
 ) -> Result<Stream> {
     match format {
-        SampleFormat::F32 => build_input_typed::<f32>(dev, config, input_channel, producer, meters),
-        SampleFormat::I16 => build_input_typed::<i16>(dev, config, input_channel, producer, meters),
-        SampleFormat::I32 => build_input_typed::<i32>(dev, config, input_channel, producer, meters),
-        SampleFormat::U16 => build_input_typed::<u16>(dev, config, input_channel, producer, meters),
-        SampleFormat::F64 => build_input_typed::<f64>(dev, config, input_channel, producer, meters),
+        SampleFormat::F32 => {
+            build_input_typed::<f32>(dev, config, out_sample_rate, input_channel, producer, meters)
+        }
+        SampleFormat::I16 => {
+            build_input_typed::<i16>(dev, config, out_sample_rate, input_channel, producer, meters)
+        }
+        SampleFormat::I32 => {
+            build_input_typed::<i32>(dev, config, out_sample_rate, input_channel, producer, meters)
+        }
+        SampleFormat::U16 => {
+            build_input_typed::<u16>(dev, config, out_sample_rate, input_channel, producer, meters)
+        }
+        SampleFormat::F64 => {
+            build_input_typed::<f64>(dev, config, out_sample_rate, input_channel, producer, meters)
+        }
         other => bail!("Formato de muestra de entrada no soportado: {other}"),
     }
 }
@@ -431,6 +438,7 @@ fn build_input_for_format(
 fn build_input_typed<T>(
     dev: &Device,
     config: StreamConfig,
+    out_sample_rate: u32,
     input_channel: usize,
     mut producer: Producer<f32>,
     meters: Arc<Meters>,
@@ -441,6 +449,7 @@ where
 {
     let channels = config.channels as usize;
     let in_ch = input_channel.min(channels.saturating_sub(1));
+    let mut resampler = Resampler::new(config.sample_rate, out_sample_rate);
     let meters_err = Arc::clone(&meters);
 
     let stream = dev.build_input_stream(
@@ -454,9 +463,11 @@ where
                 if abs > peak {
                     peak = abs;
                 }
-                if producer.push(s).is_err() {
-                    overflowed = true;
-                }
+                resampler.process_sample(s, |resampled| {
+                    if producer.push(resampled).is_err() {
+                        overflowed = true;
+                    }
+                });
             }
             if overflowed {
                 meters.overflows.fetch_add(1, Ordering::Relaxed);

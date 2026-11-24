@@ -1,6 +1,6 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use dsp::lin_to_db;
+use dsp::{lin_to_db, Chain, ParamSpec};
 
 /// Contenedor atómico lock-free para valores `f32` compartidos con el hilo de audio.
 #[derive(Debug)]
@@ -50,7 +50,7 @@ impl AtomicF32 {
     }
 }
 
-/// Configuración inicial de parámetros de la cadena de efectos.
+/// Configuración inicial de parámetros de la cadena de efectos por defecto.
 #[derive(Debug, Clone, Copy)]
 pub struct InitialParams {
     pub drive_db: f32,
@@ -80,18 +80,59 @@ impl Default for InitialParams {
     }
 }
 
-/// Parámetros compartidos entre la aplicación y el callback de audio mediante atómicos.
+/// Banco de parámetros atómicos autodescriptivos para un pedal individual.
+#[derive(Debug)]
+pub struct PedalParamSlot {
+    pub name: &'static str,
+    pub accent_color: [u8; 3],
+    pub specs: &'static [ParamSpec],
+    values: Box<[AtomicF32]>,
+    bypass: AtomicBool,
+}
+
+impl PedalParamSlot {
+    #[inline]
+    pub fn param_count(&self) -> usize {
+        self.specs.len()
+    }
+
+    #[inline]
+    pub fn get(&self, param_idx: usize) -> f32 {
+        self.values
+            .get(param_idx)
+            .map_or(0.0, |atom| atom.load())
+    }
+
+    #[inline]
+    pub fn set(&self, param_idx: usize, val: f32) {
+        if let (Some(spec), Some(atom)) = (self.specs.get(param_idx), self.values.get(param_idx)) {
+            atom.store(spec.clamp(val));
+        }
+    }
+
+    pub fn reset_defaults(&self) {
+        for (spec, atom) in self.specs.iter().zip(self.values.iter()) {
+            atom.store(spec.default);
+        }
+    }
+
+    #[inline]
+    pub fn bypass(&self) -> bool {
+        self.bypass.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn set_bypass(&self, bypass: bool) {
+        self.bypass.store(bypass, Ordering::Relaxed);
+    }
+}
+
+/// Parámetros compartidos entre la UI/CLI y el callback de audio mediante atómicos.
 #[derive(Debug)]
 pub struct Params {
-    drive_db: AtomicF32,
-    tone_hz: AtomicF32,
-    level_db: AtomicF32,
-    gate_threshold_db: AtomicF32,
-    volume_db: AtomicF32,
+    slots: Box<[PedalParamSlot]>,
+    order: Box<[AtomicUsize]>,
     mute: AtomicBool,
-    bypass_gate: AtomicBool,
-    bypass_drive: AtomicBool,
-    bypass_volume: AtomicBool,
 }
 
 impl Default for Params {
@@ -101,53 +142,124 @@ impl Default for Params {
 }
 
 impl Params {
-    pub fn from_initial(init: InitialParams) -> Self {
+    /// Construye el banco reactivo a partir de cualquier `dsp::Chain`.
+    pub fn from_chain(chain: &Chain, mute: bool) -> Self {
+        let mut slots = Vec::with_capacity(chain.len());
+        let mut order = Vec::with_capacity(chain.len());
+
+        for idx in 0..chain.len() {
+            if let Some((fx, bypass)) = chain.slot(idx) {
+                let specs = fx.params();
+                let values: Vec<AtomicF32> = (0..specs.len())
+                    .map(|p_idx| AtomicF32::new(specs[p_idx].clamp(fx.get_param(p_idx))))
+                    .collect();
+                slots.push(PedalParamSlot {
+                    name: fx.name(),
+                    accent_color: fx.accent_color(),
+                    specs,
+                    values: values.into_boxed_slice(),
+                    bypass: AtomicBool::new(*bypass),
+                });
+                order.push(AtomicUsize::new(idx));
+            }
+        }
+
         Self {
-            drive_db: AtomicF32::new(init.drive_db),
-            tone_hz: AtomicF32::new(init.tone_hz),
-            level_db: AtomicF32::new(init.level_db),
-            gate_threshold_db: AtomicF32::new(init.gate_threshold_db),
-            volume_db: AtomicF32::new(init.volume_db),
-            mute: AtomicBool::new(init.mute),
-            bypass_gate: AtomicBool::new(init.bypass_gate),
-            bypass_drive: AtomicBool::new(init.bypass_drive),
-            bypass_volume: AtomicBool::new(init.bypass_volume),
+            slots: slots.into_boxed_slice(),
+            order: order.into_boxed_slice(),
+            mute: AtomicBool::new(mute),
         }
     }
 
+    pub fn from_initial(init: InitialParams) -> Self {
+        let mut chain = crate::default_pedalboard_chain();
+        if let Some((fx, bypass)) = chain.slot_mut(0) {
+            fx.set_param(0, init.gate_threshold_db);
+            *bypass = init.bypass_gate;
+        }
+        if let Some((fx, bypass)) = chain.slot_mut(1) {
+            fx.set_param(0, init.drive_db);
+            fx.set_param(1, init.tone_hz);
+            fx.set_param(2, init.level_db);
+            *bypass = init.bypass_drive;
+        }
+        if let Some((fx, bypass)) = chain.slot_mut(2) {
+            fx.set_param(0, init.volume_db);
+            *bypass = init.bypass_volume;
+        }
+        Self::from_chain(&chain, init.mute)
+    }
+
+    #[inline]
+    pub fn slots(&self) -> &[PedalParamSlot] {
+        &self.slots
+    }
+
+    #[inline]
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline]
+    pub fn order_at(&self, cascade_pos: usize) -> usize {
+        self.order
+            .get(cascade_pos)
+            .map_or(cascade_pos, |a| a.load(Ordering::Relaxed))
+    }
+
+    pub fn swap_cascade_positions(&self, pos_a: usize, pos_b: usize) {
+        if pos_a == pos_b || pos_a >= self.order.len() || pos_b >= self.order.len() {
+            return;
+        }
+        let val_a = self.order[pos_a].load(Ordering::Acquire);
+        let val_b = self.order[pos_b].load(Ordering::Acquire);
+        self.order[pos_a].store(val_b, Ordering::Release);
+        self.order[pos_b].store(val_a, Ordering::Release);
+    }
+
     pub fn set_drive_db(&self, db: f32) {
-        self.drive_db.store(db);
+        if let Some(s) = self.slots.get(1) {
+            s.set(0, db);
+        }
     }
     pub fn drive_db(&self) -> f32 {
-        self.drive_db.load()
+        self.slots.get(1).map_or(12.0, |s| s.get(0))
     }
 
     pub fn set_tone_hz(&self, hz: f32) {
-        self.tone_hz.store(hz);
+        if let Some(s) = self.slots.get(1) {
+            s.set(1, hz);
+        }
     }
     pub fn tone_hz(&self) -> f32 {
-        self.tone_hz.load()
+        self.slots.get(1).map_or(4_000.0, |s| s.get(1))
     }
 
     pub fn set_level_db(&self, db: f32) {
-        self.level_db.store(db);
+        if let Some(s) = self.slots.get(1) {
+            s.set(2, db);
+        }
     }
     pub fn level_db(&self) -> f32 {
-        self.level_db.load()
+        self.slots.get(1).map_or(-6.0, |s| s.get(2))
     }
 
     pub fn set_gate_threshold_db(&self, db: f32) {
-        self.gate_threshold_db.store(db);
+        if let Some(s) = self.slots.first() {
+            s.set(0, db);
+        }
     }
     pub fn gate_threshold_db(&self) -> f32 {
-        self.gate_threshold_db.load()
+        self.slots.first().map_or(-60.0, |s| s.get(0))
     }
 
     pub fn set_volume_db(&self, db: f32) {
-        self.volume_db.store(db);
+        if let Some(s) = self.slots.get(2) {
+            s.set(0, db);
+        }
     }
     pub fn volume_db(&self) -> f32 {
-        self.volume_db.load()
+        self.slots.get(2).map_or(-6.0, |s| s.get(0))
     }
 
     pub fn set_mute(&self, mute: bool) {
@@ -158,24 +270,30 @@ impl Params {
     }
 
     pub fn set_bypass_gate(&self, bypass: bool) {
-        self.bypass_gate.store(bypass, Ordering::Relaxed);
+        if let Some(s) = self.slots.first() {
+            s.set_bypass(bypass);
+        }
     }
     pub fn bypass_gate(&self) -> bool {
-        self.bypass_gate.load(Ordering::Relaxed)
+        self.slots.first().is_some_and(|s| s.bypass())
     }
 
     pub fn set_bypass_drive(&self, bypass: bool) {
-        self.bypass_drive.store(bypass, Ordering::Relaxed);
+        if let Some(s) = self.slots.get(1) {
+            s.set_bypass(bypass);
+        }
     }
     pub fn bypass_drive(&self) -> bool {
-        self.bypass_drive.load(Ordering::Relaxed)
+        self.slots.get(1).is_some_and(|s| s.bypass())
     }
 
     pub fn set_bypass_volume(&self, bypass: bool) {
-        self.bypass_volume.store(bypass, Ordering::Relaxed);
+        if let Some(s) = self.slots.get(2) {
+            s.set_bypass(bypass);
+        }
     }
     pub fn bypass_volume(&self) -> bool {
-        self.bypass_volume.load(Ordering::Relaxed)
+        self.slots.get(2).is_some_and(|s| s.bypass())
     }
 }
 

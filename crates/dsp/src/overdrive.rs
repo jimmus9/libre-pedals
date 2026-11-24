@@ -1,4 +1,34 @@
-use crate::{db_to_lin, sanitize_sample, DcBlocker, Effect};
+use crate::{db_to_lin, sanitize_sample, DcBlocker, Effect, ParamScale, ParamSpec};
+
+const OVERDRIVE_PARAMS: [ParamSpec; 3] = [
+    ParamSpec {
+        name: "Drive",
+        unit: "dB",
+        min: 0.0,
+        max: 40.0,
+        default: 12.0,
+        scale: ParamScale::Linear,
+        decimals: 1,
+    },
+    ParamSpec {
+        name: "Tone",
+        unit: "Hz",
+        min: 500.0,
+        max: 12_000.0,
+        default: 4_000.0,
+        scale: ParamScale::Logarithmic,
+        decimals: 0,
+    },
+    ParamSpec {
+        name: "Level",
+        unit: "dB",
+        min: -36.0,
+        max: 12.0,
+        default: -6.0,
+        scale: ParamScale::Linear,
+        decimals: 1,
+    },
+];
 
 /// Pedal de overdrive asimétrico basado en saturación suave `tanh`.
 ///
@@ -81,6 +111,18 @@ impl Overdrive {
         self.level_lin = db_to_lin(db);
     }
 
+    pub fn drive_db(&self) -> f32 {
+        self.drive_db
+    }
+
+    pub fn tone_hz(&self) -> f32 {
+        self.tone_hz
+    }
+
+    pub fn level_db(&self) -> f32 {
+        self.level_db
+    }
+
     fn recompute_tone_alpha(&mut self) {
         let dt = 1.0 / self.sample_rate.max(1.0);
         let rc = 1.0 / (2.0 * std::f32::consts::PI * self.tone_hz);
@@ -89,6 +131,36 @@ impl Overdrive {
 }
 
 impl Effect for Overdrive {
+    fn name(&self) -> &'static str {
+        "Overdrive"
+    }
+
+    fn accent_color(&self) -> [u8; 3] {
+        [249, 115, 22]
+    }
+
+    fn params(&self) -> &'static [ParamSpec] {
+        &OVERDRIVE_PARAMS
+    }
+
+    fn get_param(&self, index: usize) -> f32 {
+        match index {
+            0 => self.drive_db,
+            1 => self.tone_hz,
+            2 => self.level_db,
+            _ => 0.0,
+        }
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        match index {
+            0 => self.set_drive_db(value),
+            1 => self.set_tone_hz(value),
+            2 => self.set_level_db(value),
+            _ => {}
+        }
+    }
+
     fn prepare(&mut self, sample_rate: f32, _max_block: usize) {
         self.sample_rate = sample_rate.max(1.0);
         self.pre_dc.prepare(self.sample_rate);

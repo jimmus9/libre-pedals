@@ -1,3 +1,5 @@
+mod gui;
+
 use std::{
     io::{self, Write},
     sync::{
@@ -12,24 +14,46 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use engine::{
     list_devices, Engine, EngineConfig, HostKind, InitialParams, Meters, Params,
 };
+use gui::{run_gui, GuiStartOptions};
 
 #[derive(Parser)]
 #[command(
     name = "pedalera",
     version,
-    about = "Pedalera virtual de guitarra en tiempo real (WASAPI + ASIO)"
+    about = "Pedalera virtual de guitarra en tiempo real (WASAPI + ASIO). Sin subcomando abre la interfaz gráfica."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Abre la interfaz gráfica de la pedalera (comportamiento por defecto)
+    Gui(GuiArgs),
     /// Lista los hosts, dispositivos de audio y configuraciones soportadas
     List,
-    /// Inicia el procesamiento de audio en tiempo real
+    /// Inicia el procesamiento de audio por consola en tiempo real
     Run(RunArgs),
+}
+
+#[derive(Args, Default)]
+struct GuiArgs {
+    /// Backend inicial (wasapi o asio)
+    #[arg(long, value_enum)]
+    host: Option<HostArg>,
+
+    /// Subcadena del dispositivo de entrada inicial
+    #[arg(long)]
+    input: Option<String>,
+
+    /// Subcadena del dispositivo de salida inicial
+    #[arg(long)]
+    output: Option<String>,
+
+    /// Iniciar con salida silenciada
+    #[arg(long, default_value_t = false)]
+    mute: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -103,10 +127,24 @@ struct RunArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    match cli.command.unwrap_or_else(|| Command::Gui(GuiArgs::default())) {
+        Command::Gui(args) => cmd_gui(args),
         Command::List => cmd_list(),
         Command::Run(args) => cmd_run(args),
     }
+}
+
+fn cmd_gui(args: GuiArgs) -> Result<()> {
+    let host = match args.host {
+        Some(h) => Some(resolve_host_kind(h)?),
+        None => None,
+    };
+    run_gui(GuiStartOptions {
+        host,
+        input: args.input,
+        output: args.output,
+        mute: args.mute,
+    })
 }
 
 fn cmd_list() -> Result<()> {
@@ -219,7 +257,14 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         "Salida:         {} ({} ch, formato {})",
         info.output_device, info.output_channels, info.output_format
     );
-    println!("Sample rate:    {} Hz", info.sample_rate);
+    if info.input_sample_rate != info.output_sample_rate {
+        println!(
+            "Sample rate:    entrada {} Hz -> salida {} Hz (resampling activo)",
+            info.input_sample_rate, info.output_sample_rate
+        );
+    } else {
+        println!("Sample rate:    {} Hz", info.sample_rate);
+    }
     println!(
         "Buffers:        entrada={} frames, salida={} frames, ring prefill={} frames",
         info.input_buffer_frames

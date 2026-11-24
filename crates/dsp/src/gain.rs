@@ -1,4 +1,14 @@
-use crate::{db_to_lin, sanitize_sample, Effect};
+use crate::{db_to_lin, sanitize_sample, Effect, ParamScale, ParamSpec};
+
+const GAIN_PARAMS: [ParamSpec; 1] = [ParamSpec {
+    name: "Volume",
+    unit: "dB",
+    min: -60.0,
+    max: 12.0,
+    default: -6.0,
+    scale: ParamScale::Linear,
+    decimals: 1,
+}];
 
 /// Pedal de ganancia / volumen con suavizado lineal por muestra para evitar clics.
 #[derive(Debug, Clone)]
@@ -42,6 +52,31 @@ impl Gain {
 }
 
 impl Effect for Gain {
+    fn name(&self) -> &'static str {
+        "Master Volume"
+    }
+
+    fn accent_color(&self) -> [u8; 3] {
+        [34, 197, 94]
+    }
+
+    fn params(&self) -> &'static [ParamSpec] {
+        &GAIN_PARAMS
+    }
+
+    fn get_param(&self, index: usize) -> f32 {
+        match index {
+            0 => self.db(),
+            _ => 0.0,
+        }
+    }
+
+    fn set_param(&mut self, index: usize, value: f32) {
+        if index == 0 {
+            self.set_db(value);
+        }
+    }
+
     fn prepare(&mut self, sample_rate: f32, _max_block: usize) {
         let sr = sample_rate.max(1.0);
         self.ramp_samples = (0.010 * sr).max(1.0);
