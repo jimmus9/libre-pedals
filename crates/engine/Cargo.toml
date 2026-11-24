@@ -2,6 +2,9 @@
 name = "engine"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/jimmus9/libre-pedals"
+description = "Motor de audio WASAPI y ASIO para pedalera de guitarra en tiempo real"
 
 [features]
 default = []

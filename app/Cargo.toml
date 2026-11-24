@@ -2,6 +2,9 @@
 name = "pedalera"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/jimmus9/libre-pedals"
+description = "Pedalera virtual de guitarra en tiempo real con interfaz gráfica y analizador"
 
 [features]
 default = []
