@@ -1,10 +1,15 @@
 use std::any::Any;
 
+pub mod analyzer;
 pub mod gain;
 pub mod gate;
 pub mod overdrive;
 pub mod resampler;
 
+pub use analyzer::{
+    compute_spectrum_db, compute_waveform_metrics, fft_in_place, find_rising_zero_crossing,
+    WaveformMetrics,
+};
 pub use gain::Gain;
 pub use gate::NoiseGate;
 pub use overdrive::Overdrive;
@@ -602,5 +607,45 @@ mod tests {
         let rms_b: f32 = buf_b.iter().map(|x| x * x).sum();
         // Al atenuar -20 dB después del overdrive vs antes del overdrive el nivel difiere claramente.
         assert!((rms_a - rms_b).abs() > 1e-4);
+    }
+
+    #[test]
+    fn analyzer_fft_and_crest_factor_match_pure_sine() {
+        const N: usize = 2048;
+        let sr = 48_000.0_f32;
+        let freq = 1_000.0_f32;
+        let amp = 0.5_f32; // -6.02 dBFS
+
+        let samples: Vec<f32> = (0..N)
+            .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / sr).sin())
+            .collect();
+
+        let metrics = compute_waveform_metrics(&samples);
+        assert!(
+            (metrics.crest_factor_db - 3.0103).abs() < 0.12,
+            "unexpected crest factor {}",
+            metrics.crest_factor_db
+        );
+
+        let mut spectrum = vec![-100.0_f32; N / 2];
+        compute_spectrum_db(&samples, &mut spectrum);
+
+        let (peak_bin, &peak_db) = spectrum
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let expected_bin = ((freq * N as f32) / sr).round() as isize;
+        assert!(
+            (peak_bin as isize - expected_bin).abs() <= 1,
+            "expected bin near {expected_bin}, got {peak_bin}"
+        );
+        assert!(
+            (peak_db - (-6.02)).abs() < 1.5,
+            "expected peak near -6.02 dBFS, got {peak_db}"
+        );
+
+        let zc = find_rising_zero_crossing(&samples[10..], 200);
+        assert!(zc > 0 && zc < 60);
     }
 }

@@ -1,3 +1,4 @@
+mod analyzer_ui;
 mod gui;
 
 use std::{
@@ -242,6 +243,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         input_channel: args.in_channel,
         buffer_frames: args.buffer,
         latency_frames: args.latency,
+        processing_sample_rate: None,
         params: Arc::clone(&params),
         meters: Arc::clone(&meters),
     })?;
@@ -257,13 +259,13 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         "Salida:         {} ({} ch, formato {})",
         info.output_device, info.output_channels, info.output_format
     );
-    if info.input_sample_rate != info.output_sample_rate {
+    if info.is_resampling_input || info.is_resampling_output {
         println!(
-            "Sample rate:    entrada {} Hz -> salida {} Hz (resampling activo)",
-            info.input_sample_rate, info.output_sample_rate
+            "Sample rate:    entrada {} Hz -> DSP {} Hz -> salida {} Hz",
+            info.input_sample_rate, info.processing_sample_rate, info.output_sample_rate
         );
     } else {
-        println!("Sample rate:    {} Hz", info.sample_rate);
+        println!("Sample rate:    {} Hz (1:1 sin resampleo)", info.sample_rate);
     }
     println!(
         "Buffers:        entrada={} frames, salida={} frames, ring prefill={} frames",

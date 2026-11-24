@@ -19,6 +19,8 @@ pub use devices::{list_devices, ConfigSummary, DeviceReport, HostKind, HostRepor
 pub use params::{InitialParams, MeterSnapshot, Meters, Params, PedalParamSlot};
 
 const SCRATCH_FRAMES: usize = 8192;
+const MICRO_BLOCK_FRAMES: usize = 64;
+const ANALYSIS_RING_CAPACITY: usize = 65_536;
 
 /// Parámetros de arranque del motor de audio.
 pub struct EngineConfig {
@@ -28,6 +30,8 @@ pub struct EngineConfig {
     pub input_channel: usize,
     pub buffer_frames: Option<u32>,
     pub latency_frames: Option<u32>,
+    /// Resolución interna de procesado DSP en Hz. `None` usa la nativa de entrada sin resamplear.
+    pub processing_sample_rate: Option<u32>,
     pub params: Arc<Params>,
     pub meters: Arc<Meters>,
 }
@@ -40,7 +44,10 @@ pub struct EngineInfo {
     pub output_device: String,
     pub sample_rate: u32,
     pub input_sample_rate: u32,
+    pub processing_sample_rate: u32,
     pub output_sample_rate: u32,
+    pub is_resampling_input: bool,
+    pub is_resampling_output: bool,
     pub input_channels: u16,
     pub output_channels: u16,
     pub input_channel_used: usize,
@@ -56,6 +63,7 @@ pub struct EngineInfo {
 /// Motor de audio activo. Mantener vivo mientras dure el procesamiento.
 pub struct Engine {
     info: EngineInfo,
+    analysis_consumer: Consumer<(f32, f32)>,
     _input_stream: Stream,
     _output_stream: Stream,
 }
@@ -63,6 +71,13 @@ pub struct Engine {
 impl Engine {
     pub fn info(&self) -> &EngineInfo {
         &self.info
+    }
+
+    /// Drena todos los pares `(pre_limpio, post_efectos)` disponibles para osciloscopio y FFT.
+    pub fn poll_analysis(&mut self, mut on_pair: impl FnMut(f32, f32)) {
+        while let Ok((pre, post)) = self.analysis_consumer.pop() {
+            on_pair(pre, post);
+        }
     }
 
     /// Abre los dispositivos elegidos, configura la cadena DSP y arranca los streams.
@@ -82,7 +97,7 @@ impl Engine {
             .default_output_config()
             .with_context(|| format!("El dispositivo de salida '{out_name}' no soporta reproducción"))?;
 
-        let (in_supported, out_supported) = resolve_common_configs(
+        let (in_supported, out_supported) = resolve_native_configs(
             &in_dev,
             &out_dev,
             &in_name,
@@ -93,6 +108,22 @@ impl Engine {
 
         let in_sample_rate = in_supported.sample_rate();
         let out_sample_rate = out_supported.sample_rate();
+        let proc_sample_rate = match cfg.processing_sample_rate {
+            None => in_sample_rate,
+            Some(req_sr) => {
+                if req_sr == 0 {
+                    bail!("La resolución de procesado debe ser mayor a 0 Hz.");
+                }
+                if req_sr > in_sample_rate {
+                    bail!(
+                        "La resolución de procesado solicitada ({req_sr} Hz) supera la frecuencia nativa \
+                         de entrada '{in_name}' ({in_sample_rate} Hz). No se puede procesar por encima de la resolución original."
+                    );
+                }
+                req_sr
+            }
+        };
+
         let in_channels = in_supported.channels();
         let out_channels = out_supported.channels();
 
@@ -115,28 +146,38 @@ impl Engine {
         let out_nominal = cfg
             .buffer_frames
             .or_else(|| exact_buffer_size(out_supported.buffer_size()));
-        let nominal_buf = out_nominal.or(in_nominal);
 
-        let prefill_frames = cfg.latency_frames.unwrap_or_else(|| match nominal_buf {
+        let in_proc_buf = in_nominal.map(|b| scale_frames(b, in_sample_rate, proc_sample_rate));
+        let out_proc_buf = out_nominal.map(|b| scale_frames(b, out_sample_rate, proc_sample_rate));
+        let nominal_proc_buf = match (in_proc_buf, out_proc_buf) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+
+        let prefill_frames = cfg.latency_frames.unwrap_or_else(|| match nominal_proc_buf {
             Some(b) if b > 0 => b.saturating_mul(2),
-            _ => 512_u32.saturating_mul((out_sample_rate / 48_000).max(1)),
+            _ => 512_u32.saturating_mul((proc_sample_rate / 48_000).max(1)),
         });
 
         let ring_capacity = (prefill_frames as usize).saturating_mul(8).max(32_768);
         let drift_control = matches!(cfg.host, HostKind::Wasapi);
-        let initial_drift_buf = nominal_buf.unwrap_or(256);
+        let initial_drift_buf = nominal_proc_buf.unwrap_or(256);
         let max_ring_fill = Arc::new(AtomicU32::new(
             prefill_frames.saturating_add(initial_drift_buf.saturating_mul(2)),
         ));
 
         let mut warnings = Vec::new();
-        let requested_buf = cfg.buffer_frames.map(BufferSize::Fixed).unwrap_or(BufferSize::Default);
+        let requested_buf = cfg
+            .buffer_frames
+            .map(BufferSize::Fixed)
+            .unwrap_or(BufferSize::Default);
 
-        let (input_stream, output_stream) = build_stream_pair_with_fallback(
+        let (input_stream, output_stream, analysis_consumer) = build_stream_pair_with_fallback(
             &in_dev,
             &out_dev,
             &in_supported,
             &out_supported,
+            proc_sample_rate,
             requested_buf,
             cfg.input_channel,
             ring_capacity,
@@ -151,10 +192,13 @@ impl Engine {
         let input_buffer_frames = input_stream.buffer_size().ok();
         let output_buffer_frames = output_stream.buffer_size().ok();
 
-        let drift_buf = output_buffer_frames
-            .or(input_buffer_frames)
-            .or(nominal_buf)
-            .unwrap_or(256);
+        let actual_in_proc = input_buffer_frames.map(|b| scale_frames(b, in_sample_rate, proc_sample_rate));
+        let actual_out_proc =
+            output_buffer_frames.map(|b| scale_frames(b, out_sample_rate, proc_sample_rate));
+        let drift_buf = match (actual_in_proc, actual_out_proc) {
+            (Some(a), Some(b)) => a.max(b),
+            (a, b) => a.or(b).or(nominal_proc_buf).unwrap_or(256),
+        };
         max_ring_fill.store(
             prefill_frames.saturating_add(drift_buf.saturating_mul(2)),
             Ordering::Release,
@@ -170,17 +214,20 @@ impl Engine {
         let in_lat_frames = input_buffer_frames.or(cfg.buffer_frames).unwrap_or(0);
         let out_lat_frames = output_buffer_frames.or(cfg.buffer_frames).unwrap_or(0);
         let in_lat_ms = in_lat_frames as f32 * 1_000.0 / in_sample_rate as f32;
-        let out_lat_ms =
-            (out_lat_frames + prefill_frames) as f32 * 1_000.0 / out_sample_rate as f32;
-        let estimated_latency_ms = in_lat_ms + out_lat_ms;
+        let prefill_ms = prefill_frames as f32 * 1_000.0 / proc_sample_rate as f32;
+        let out_lat_ms = out_lat_frames as f32 * 1_000.0 / out_sample_rate as f32;
+        let estimated_latency_ms = in_lat_ms + prefill_ms + out_lat_ms;
 
         let info = EngineInfo {
             host: cfg.host,
             input_device: in_name,
             output_device: out_name,
-            sample_rate: out_sample_rate,
+            sample_rate: proc_sample_rate,
             input_sample_rate: in_sample_rate,
+            processing_sample_rate: proc_sample_rate,
             output_sample_rate: out_sample_rate,
+            is_resampling_input: in_sample_rate != proc_sample_rate,
+            is_resampling_output: proc_sample_rate != out_sample_rate,
             input_channels: in_channels,
             output_channels: out_channels,
             input_channel_used: cfg.input_channel,
@@ -195,9 +242,21 @@ impl Engine {
 
         Ok(Self {
             info,
+            analysis_consumer,
             _input_stream: input_stream,
             _output_stream: output_stream,
         })
+    }
+}
+
+#[inline]
+fn scale_frames(frames: u32, from_sr: u32, to_sr: u32) -> u32 {
+    if from_sr == to_sr || from_sr == 0 || to_sr == 0 {
+        frames
+    } else {
+        ((frames as f64) * (to_sr as f64 / from_sr as f64))
+            .ceil()
+            .max(1.0) as u32
     }
 }
 
@@ -207,6 +266,7 @@ fn build_stream_pair_with_fallback(
     out_dev: &Device,
     in_supported: &SupportedStreamConfig,
     out_supported: &SupportedStreamConfig,
+    proc_sample_rate: u32,
     requested_buf: BufferSize,
     input_channel: usize,
     ring_capacity: usize,
@@ -216,12 +276,14 @@ fn build_stream_pair_with_fallback(
     meters: &Arc<Meters>,
     max_ring_fill: &Arc<AtomicU32>,
     warnings: &mut Vec<String>,
-) -> Result<(Stream, Stream)> {
+) -> Result<(Stream, Stream, Consumer<(f32, f32)>)> {
     let mut in_buf_mode = requested_buf;
     let mut out_buf_mode = requested_buf;
 
     for attempt in 0..3 {
         let (producer, consumer) = create_prefilled_ring(ring_capacity, prefill_frames);
+        let (analysis_producer, analysis_consumer) =
+            RingBuffer::<(f32, f32)>::new(ANALYSIS_RING_CAPACITY);
 
         let mut in_cfg = in_supported.config();
         in_cfg.buffer_size = in_buf_mode;
@@ -229,7 +291,7 @@ fn build_stream_pair_with_fallback(
             in_dev,
             in_cfg,
             in_supported.sample_format(),
-            out_supported.sample_rate(),
+            proc_sample_rate,
             input_channel,
             producer,
             Arc::clone(meters),
@@ -250,9 +312,14 @@ fn build_stream_pair_with_fallback(
             Err(e) => return Err(e).context("Error al abrir stream de entrada"),
         };
 
-        // En este punto `producer` fue consumido por `input_stream`; preparamos la cadena DSP.
+        // Preparamos la cadena DSP a la frecuencia de procesamiento (`proc_sample_rate`).
         let mut chain = build_pedalboard_chain(params);
-        chain.prepare(out_supported.sample_rate() as f32, SCRATCH_FRAMES);
+        let max_block = if proc_sample_rate == out_supported.sample_rate() {
+            SCRATCH_FRAMES
+        } else {
+            MICRO_BLOCK_FRAMES
+        };
+        chain.prepare(proc_sample_rate as f32, max_block);
 
         let mut out_cfg = out_supported.config();
         out_cfg.buffer_size = out_buf_mode;
@@ -260,7 +327,9 @@ fn build_stream_pair_with_fallback(
             out_dev,
             out_cfg,
             out_supported.sample_format(),
+            proc_sample_rate,
             consumer,
+            analysis_producer,
             chain,
             Arc::clone(params),
             Arc::clone(meters),
@@ -270,7 +339,7 @@ fn build_stream_pair_with_fallback(
         );
 
         match out_res {
-            Ok(output_stream) => return Ok((input_stream, output_stream)),
+            Ok(output_stream) => return Ok((input_stream, output_stream, analysis_consumer)),
             Err(e) if attempt < 2 && out_buf_mode != BufferSize::Default => {
                 let warn = format!(
                     "No se pudo abrir salida con buffer {:?} ({e}); reintentando con Default.",
@@ -303,7 +372,7 @@ fn exact_buffer_size(buf: &SupportedBufferSize) -> Option<u32> {
     }
 }
 
-fn resolve_common_configs(
+fn resolve_native_configs(
     in_dev: &Device,
     out_dev: &Device,
     in_name: &str,
@@ -311,17 +380,18 @@ fn resolve_common_configs(
     in_default: &SupportedStreamConfig,
     out_default: &SupportedStreamConfig,
 ) -> Result<(SupportedStreamConfig, SupportedStreamConfig)> {
+    // Si ambos reportan frecuencia nativa válida, respetamos la frecuencia nativa de entrada
+    // (sin degradarla ni resamplear antes de los pedales; el resampleo si hiciera falta va al final).
+    if in_default.sample_rate() > 0 && out_default.sample_rate() > 0 {
+        return Ok((*in_default, *out_default));
+    }
+
     if out_default.sample_rate() > 0 {
         let target_sr = out_default.sample_rate();
         if let Some(in_cfg) =
             pick_config_for_rate(in_default, in_dev.supported_input_configs(), target_sr)
         {
             return Ok((in_cfg, *out_default));
-        }
-        // Si la entrada no soporta la frecuencia de salida de forma nativa, usamos sus
-        // frecuencias nativas y el Resampler cúbico convierte en tiempo real.
-        if in_default.sample_rate() > 0 {
-            return Ok((*in_default, *out_default));
         }
     }
 
@@ -410,26 +480,26 @@ fn build_input_for_format(
     dev: &Device,
     config: StreamConfig,
     format: SampleFormat,
-    out_sample_rate: u32,
+    proc_sample_rate: u32,
     input_channel: usize,
     producer: Producer<f32>,
     meters: Arc<Meters>,
 ) -> Result<Stream> {
     match format {
         SampleFormat::F32 => {
-            build_input_typed::<f32>(dev, config, out_sample_rate, input_channel, producer, meters)
+            build_input_typed::<f32>(dev, config, proc_sample_rate, input_channel, producer, meters)
         }
         SampleFormat::I16 => {
-            build_input_typed::<i16>(dev, config, out_sample_rate, input_channel, producer, meters)
+            build_input_typed::<i16>(dev, config, proc_sample_rate, input_channel, producer, meters)
         }
         SampleFormat::I32 => {
-            build_input_typed::<i32>(dev, config, out_sample_rate, input_channel, producer, meters)
+            build_input_typed::<i32>(dev, config, proc_sample_rate, input_channel, producer, meters)
         }
         SampleFormat::U16 => {
-            build_input_typed::<u16>(dev, config, out_sample_rate, input_channel, producer, meters)
+            build_input_typed::<u16>(dev, config, proc_sample_rate, input_channel, producer, meters)
         }
         SampleFormat::F64 => {
-            build_input_typed::<f64>(dev, config, out_sample_rate, input_channel, producer, meters)
+            build_input_typed::<f64>(dev, config, proc_sample_rate, input_channel, producer, meters)
         }
         other => bail!("Formato de muestra de entrada no soportado: {other}"),
     }
@@ -438,7 +508,7 @@ fn build_input_for_format(
 fn build_input_typed<T>(
     dev: &Device,
     config: StreamConfig,
-    out_sample_rate: u32,
+    proc_sample_rate: u32,
     input_channel: usize,
     mut producer: Producer<f32>,
     meters: Arc<Meters>,
@@ -449,7 +519,7 @@ where
 {
     let channels = config.channels as usize;
     let in_ch = input_channel.min(channels.saturating_sub(1));
-    let mut resampler = Resampler::new(config.sample_rate, out_sample_rate);
+    let mut in_resampler = Resampler::new(config.sample_rate, proc_sample_rate);
     let meters_err = Arc::clone(&meters);
 
     let stream = dev.build_input_stream(
@@ -457,17 +527,30 @@ where
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             let mut peak = 0.0_f32;
             let mut overflowed = false;
-            for frame in data.chunks_exact(channels) {
-                let s = frame[in_ch].to_sample::<f32>();
-                let abs = s.abs();
-                if abs > peak {
-                    peak = abs;
-                }
-                resampler.process_sample(s, |resampled| {
-                    if producer.push(resampled).is_err() {
+            if in_resampler.is_passthrough() {
+                for frame in data.chunks_exact(channels) {
+                    let s = frame[in_ch].to_sample::<f32>();
+                    let abs = s.abs();
+                    if abs > peak {
+                        peak = abs;
+                    }
+                    if producer.push(s).is_err() {
                         overflowed = true;
                     }
-                });
+                }
+            } else {
+                for frame in data.chunks_exact(channels) {
+                    let s = frame[in_ch].to_sample::<f32>();
+                    let abs = s.abs();
+                    if abs > peak {
+                        peak = abs;
+                    }
+                    in_resampler.process_sample(s, |resampled| {
+                        if producer.push(resampled).is_err() {
+                            overflowed = true;
+                        }
+                    });
+                }
             }
             if overflowed {
                 meters.overflows.fetch_add(1, Ordering::Relaxed);
@@ -488,7 +571,9 @@ fn build_output_for_format(
     dev: &Device,
     config: StreamConfig,
     format: SampleFormat,
+    proc_sample_rate: u32,
     consumer: Consumer<f32>,
+    analysis_producer: Producer<(f32, f32)>,
     chain: Chain,
     params: Arc<Params>,
     meters: Arc<Meters>,
@@ -500,7 +585,9 @@ fn build_output_for_format(
         SampleFormat::F32 => build_output_typed::<f32>(
             dev,
             config,
+            proc_sample_rate,
             consumer,
+            analysis_producer,
             chain,
             params,
             meters,
@@ -511,7 +598,9 @@ fn build_output_for_format(
         SampleFormat::I16 => build_output_typed::<i16>(
             dev,
             config,
+            proc_sample_rate,
             consumer,
+            analysis_producer,
             chain,
             params,
             meters,
@@ -522,7 +611,9 @@ fn build_output_for_format(
         SampleFormat::I32 => build_output_typed::<i32>(
             dev,
             config,
+            proc_sample_rate,
             consumer,
+            analysis_producer,
             chain,
             params,
             meters,
@@ -533,7 +624,9 @@ fn build_output_for_format(
         SampleFormat::U16 => build_output_typed::<u16>(
             dev,
             config,
+            proc_sample_rate,
             consumer,
+            analysis_producer,
             chain,
             params,
             meters,
@@ -544,7 +637,9 @@ fn build_output_for_format(
         SampleFormat::F64 => build_output_typed::<f64>(
             dev,
             config,
+            proc_sample_rate,
             consumer,
+            analysis_producer,
             chain,
             params,
             meters,
@@ -560,7 +655,9 @@ fn build_output_for_format(
 fn build_output_typed<T>(
     dev: &Device,
     config: StreamConfig,
+    proc_sample_rate: u32,
     mut consumer: Consumer<f32>,
+    mut analysis_producer: Producer<(f32, f32)>,
     mut chain: Chain,
     params: Arc<Params>,
     meters: Arc<Meters>,
@@ -572,7 +669,12 @@ where
     T: SizedSample + FromSample<f32> + Send + 'static,
 {
     let out_channels = config.channels as usize;
+    let out_sample_rate = config.sample_rate;
     let mut scratch = vec![0.0_f32; SCRATCH_FRAMES];
+    let mut pre_scratch = vec![0.0_f32; SCRATCH_FRAMES];
+    let mut out_resampler = Resampler::new(proc_sample_rate, out_sample_rate);
+    let mut fifo_buf = vec![0.0_f32; 16_384];
+    let mut fifo_len = 0usize;
     let meters_err = Arc::clone(&meters);
 
     let stream = dev.build_output_stream(
@@ -587,12 +689,13 @@ where
             let muted = params.mute();
 
             if drift_control {
+                let min_keep_proc = scale_frames(frames_needed as u32, out_sample_rate, proc_sample_rate) as usize;
                 let max_fill = max_ring_fill.load(Ordering::Relaxed) as usize;
                 let avail = consumer.slots();
-                if avail > max_fill && avail > frames_needed {
+                if avail > max_fill && avail > min_keep_proc {
                     let excess = avail
                         .saturating_sub(target_fill)
-                        .min(avail.saturating_sub(frames_needed));
+                        .min(avail.saturating_sub(min_keep_proc));
                     if excess > 0 {
                         for _ in 0..excess {
                             let _ = consumer.pop();
@@ -602,40 +705,106 @@ where
                 }
             }
 
-            let mut frame_offset = 0;
             let mut out_peak = 0.0_f32;
             let mut had_underrun = false;
 
-            while frame_offset < frames_needed {
-                let chunk_frames = (frames_needed - frame_offset).min(scratch.len());
-                let block = &mut scratch[..chunk_frames];
+            if out_resampler.is_passthrough() {
+                // Camino directo 1:1 sin ningún resampleo.
+                let mut frame_offset = 0;
+                while frame_offset < frames_needed {
+                    let chunk_frames = (frames_needed - frame_offset).min(scratch.len());
+                    let block = &mut scratch[..chunk_frames];
+                    let pre_block = &mut pre_scratch[..chunk_frames];
 
-                for slot in block.iter_mut() {
-                    match consumer.pop() {
-                        Ok(s) => *slot = s,
-                        Err(_) => {
-                            *slot = 0.0;
-                            had_underrun = true;
+                    for (slot, pre_slot) in block.iter_mut().zip(pre_block.iter_mut()) {
+                        let s = match consumer.pop() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                had_underrun = true;
+                                0.0
+                            }
+                        };
+                        *slot = s;
+                        *pre_slot = s;
+                    }
+
+                    chain.process(block);
+
+                    for (i, (&pre, &post)) in pre_block.iter().zip(block.iter()).enumerate() {
+                        let _ = analysis_producer.push((pre, post));
+                        let out_f32 = if muted { 0.0 } else { post };
+                        let abs = out_f32.abs();
+                        if abs > out_peak {
+                            out_peak = abs;
                         }
+                        let converted = out_f32.clamp(-1.0, 1.0).to_sample::<T>();
+                        let base = (frame_offset + i) * out_channels;
+                        for ch in 0..out_channels {
+                            data[base + ch] = converted;
+                        }
+                    }
+
+                    frame_offset += chunk_frames;
+                }
+            } else {
+                // Todo el DSP y el análisis corren a `proc_sample_rate`; el resampleo ocurre
+                // estrictamente al final de la cadena antes de escribir al dispositivo de salida.
+                let needed_capped = frames_needed.min(fifo_buf.len());
+                while fifo_len < needed_capped {
+                    let block = &mut scratch[..MICRO_BLOCK_FRAMES];
+                    let pre_block = &mut pre_scratch[..MICRO_BLOCK_FRAMES];
+
+                    for (slot, pre_slot) in block.iter_mut().zip(pre_block.iter_mut()) {
+                        let s = match consumer.pop() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                had_underrun = true;
+                                0.0
+                            }
+                        };
+                        *slot = s;
+                        *pre_slot = s;
+                    }
+
+                    chain.process(block);
+
+                    for (&pre, &post) in pre_block.iter().zip(block.iter()) {
+                        let _ = analysis_producer.push((pre, post));
+                        out_resampler.process_sample(post, |y_out| {
+                            if fifo_len < fifo_buf.len() {
+                                fifo_buf[fifo_len] = y_out;
+                                fifo_len += 1;
+                            }
+                        });
                     }
                 }
 
-                chain.process(block);
-
-                for (i, &y) in block.iter().enumerate() {
-                    let out_f32 = if muted { 0.0 } else { y };
+                let write_count = frames_needed.min(fifo_len);
+                for (i, &y_out) in fifo_buf[..write_count].iter().enumerate() {
+                    let out_f32 = if muted { 0.0 } else { y_out };
                     let abs = out_f32.abs();
                     if abs > out_peak {
                         out_peak = abs;
                     }
                     let converted = out_f32.clamp(-1.0, 1.0).to_sample::<T>();
-                    let base = (frame_offset + i) * out_channels;
+                    let base = i * out_channels;
+                    for ch in 0..out_channels {
+                        data[base + ch] = converted;
+                    }
+                }
+                for i in write_count..frames_needed {
+                    let converted = 0.0_f32.to_sample::<T>();
+                    let base = i * out_channels;
                     for ch in 0..out_channels {
                         data[base + ch] = converted;
                     }
                 }
 
-                frame_offset += chunk_frames;
+                let rem = fifo_len.saturating_sub(write_count);
+                if rem > 0 {
+                    fifo_buf.copy_within(write_count..fifo_len, 0);
+                }
+                fifo_len = rem;
             }
 
             if had_underrun {

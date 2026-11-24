@@ -9,9 +9,11 @@ use eframe::egui::{
     StrokeKind, Vec2,
 };
 use engine::{
-    list_devices, Engine, EngineConfig, EngineInfo, HostKind, HostReport, InitialParams,
-    MeterSnapshot, Meters, Params, PedalParamSlot,
+    list_devices, Engine, EngineConfig, HostKind, HostReport, InitialParams, MeterSnapshot,
+    Meters, Params, PedalParamSlot,
 };
+
+use crate::analyzer_ui::AnalyzerState;
 
 #[derive(Debug, Clone, Default)]
 pub struct GuiStartOptions {
@@ -30,12 +32,20 @@ const BUFFER_OPTIONS: [Option<u32>; 6] = [
     Some(1024),
 ];
 
+const PROC_RATE_OPTIONS: [Option<u32>; 5] = [
+    None,
+    Some(44_100),
+    Some(48_000),
+    Some(96_000),
+    Some(192_000),
+];
+
 pub fn run_gui(opts: GuiStartOptions) -> anyhow::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Pedalera Virtual — Guitar FX")
-            .with_inner_size([1240.0, 700.0])
-            .with_min_inner_size([840.0, 560.0]),
+            .with_title("Pedalera Virtual — Guitar FX & Analizador")
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([760.0, 520.0]),
         ..Default::default()
     };
 
@@ -65,14 +75,17 @@ struct PedalboardApp {
     meters: Arc<Meters>,
     engine: Option<Engine>,
     reports: Vec<HostReport>,
+    analyzer: AnalyzerState,
 
     selected_host: HostKind,
     selected_input: Option<String>,
     selected_output: Option<String>,
     selected_in_channel: usize,
     selected_buffer: Option<u32>,
+    selected_proc_rate: Option<u32>,
 
     last_error: Option<String>,
+    resolution_warning: Option<String>,
     last_snapshot: MeterSnapshot,
     smooth_in_db: f32,
     smooth_out_db: f32,
@@ -95,12 +108,15 @@ impl PedalboardApp {
             meters,
             engine: None,
             reports,
+            analyzer: AnalyzerState::new(),
             selected_host,
             selected_input: opts.input,
             selected_output: opts.output,
             selected_in_channel: 0,
             selected_buffer: None,
+            selected_proc_rate: None,
             last_error: None,
+            resolution_warning: None,
             last_snapshot: MeterSnapshot {
                 input_peak: 0.0,
                 output_peak: 0.0,
@@ -125,28 +141,46 @@ impl PedalboardApp {
         self.reports.iter().find(|r| r.host == self.selected_host)
     }
 
-    fn input_device_names(&self) -> Vec<String> {
+    fn input_devices_with_rates(&self) -> Vec<(String, Option<u32>)> {
         self.current_host_report()
             .map(|h| {
                 h.devices
                     .iter()
                     .filter(|d| d.input_channels.unwrap_or(0) > 0)
-                    .map(|d| d.name.clone())
+                    .map(|d| (d.name.clone(), d.default_input.as_ref().map(|c| c.sample_rate)))
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    fn output_device_names(&self) -> Vec<String> {
+    fn output_devices_with_rates(&self) -> Vec<(String, Option<u32>)> {
         self.current_host_report()
             .map(|h| {
                 h.devices
                     .iter()
                     .filter(|d| d.output_channels.unwrap_or(0) > 0)
-                    .map(|d| d.name.clone())
+                    .map(|d| (d.name.clone(), d.default_output.as_ref().map(|c| c.sample_rate)))
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn selected_input_native_rate(&self) -> Option<u32> {
+        let host = self.current_host_report()?;
+        let sel = self.selected_input.as_ref()?;
+        host.devices
+            .iter()
+            .find(|d| &d.name == sel)
+            .and_then(|d| d.default_input.as_ref().map(|c| c.sample_rate))
+    }
+
+    fn selected_output_native_rate(&self) -> Option<u32> {
+        let host = self.current_host_report()?;
+        let sel = self.selected_output.as_ref()?;
+        host.devices
+            .iter()
+            .find(|d| &d.name == sel)
+            .and_then(|d| d.default_output.as_ref().map(|c| c.sample_rate))
     }
 
     fn max_input_channels(&self) -> usize {
@@ -162,23 +196,43 @@ impl PedalboardApp {
     }
 
     fn select_defaults_if_missing(&mut self) {
-        let (def_in_name, def_out_name) = {
+        let (def_in_name, def_in_rate, def_out_name) = {
             let Some(host) = self.current_host_report() else {
                 return;
             };
-            let def_in = host
+            let def_in_dev = host
                 .devices
                 .iter()
                 .find(|d| d.is_default_input && d.input_channels.unwrap_or(0) > 0)
-                .or_else(|| host.devices.iter().find(|d| d.input_channels.unwrap_or(0) > 0))
-                .map(|d| d.name.clone());
-            let def_out = host
+                .or_else(|| host.devices.iter().find(|d| d.input_channels.unwrap_or(0) > 0));
+            let def_in_name = def_in_dev.map(|d| d.name.clone());
+            let in_rate = self
+                .selected_input
+                .as_ref()
+                .and_then(|n| host.devices.iter().find(|d| &d.name == n))
+                .or(def_in_dev)
+                .and_then(|d| d.default_input.as_ref().map(|c| c.sample_rate));
+
+            let sys_def_out = host
                 .devices
                 .iter()
-                .find(|d| d.is_default_output && d.output_channels.unwrap_or(0) > 0)
+                .find(|d| d.is_default_output && d.output_channels.unwrap_or(0) > 0);
+            let same_rate_out = in_rate.and_then(|sr| {
+                if sys_def_out.and_then(|d| d.default_output.as_ref().map(|c| c.sample_rate)) == Some(sr) {
+                    sys_def_out
+                } else {
+                    host.devices.iter().find(|d| {
+                        d.output_channels.unwrap_or(0) > 0
+                            && d.default_output.as_ref().map(|c| c.sample_rate) == Some(sr)
+                    })
+                }
+            });
+            let def_out_name = same_rate_out
+                .or(sys_def_out)
                 .or_else(|| host.devices.iter().find(|d| d.output_channels.unwrap_or(0) > 0))
                 .map(|d| d.name.clone());
-            (def_in, def_out)
+
+            (def_in_name, in_rate, def_out_name)
         };
 
         if self.selected_input.is_none() {
@@ -192,6 +246,12 @@ impl PedalboardApp {
 
         if self.selected_output.is_none() {
             self.selected_output = def_out_name;
+        }
+
+        if let (Some(req), Some(in_sr)) = (self.selected_proc_rate, def_in_rate) {
+            if req > in_sr {
+                self.selected_proc_rate = None;
+            }
         }
 
         let max_ch = self.max_input_channels();
@@ -227,6 +287,15 @@ impl PedalboardApp {
             self.selected_output = self.selected_input.clone();
         }
 
+        if let (Some(req_sr), Some(in_sr)) = (self.selected_proc_rate, self.selected_input_native_rate()) {
+            if req_sr > in_sr {
+                self.resolution_warning = Some(format!(
+                    "⚠ Resolución {req_sr} Hz supera la frecuencia nativa de entrada ({in_sr} Hz). Se usa nativa ({in_sr} Hz)."
+                ));
+                self.selected_proc_rate = None;
+            }
+        }
+
         let max_ch = self.max_input_channels();
         if self.selected_in_channel >= max_ch {
             self.selected_in_channel = 0;
@@ -240,6 +309,7 @@ impl PedalboardApp {
             input_channel: self.selected_in_channel,
             buffer_frames: self.selected_buffer,
             latency_frames: None,
+            processing_sample_rate: self.selected_proc_rate,
             params: Arc::clone(&self.params),
             meters: Arc::clone(&self.meters),
         };
@@ -261,10 +331,21 @@ impl PedalboardApp {
         self.smooth_out_db = -120.0;
     }
 
-    fn update_meters(&mut self) {
+    fn update_meters(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame_time).as_secs_f32().min(0.2);
         self.last_frame_time = now;
+
+        let proc_sr = self
+            .engine
+            .as_ref()
+            .map(|e| e.info().processing_sample_rate)
+            .or(self.selected_proc_rate)
+            .or_else(|| self.selected_input_native_rate())
+            .unwrap_or(48_000);
+
+        self.analyzer
+            .update_from_engine(ctx, self.engine.as_mut(), proc_sr);
 
         if self.engine.is_some() {
             let snap = self.meters.snapshot_and_reset_peaks();
@@ -301,7 +382,7 @@ impl PedalboardApp {
     fn draw_studio_rack(&mut self, ui: &mut egui::Ui) {
         let rack_frame = Frame::new()
             .fill(Color32::from_rgb(18, 22, 29))
-            .inner_margin(Margin::symmetric(14, 10))
+            .inner_margin(Margin::symmetric(14, 8))
             .stroke(Stroke::new(1.0, Color32::from_rgb(38, 45, 58)));
 
         egui::Panel::top("studio_rack")
@@ -312,6 +393,16 @@ impl PedalboardApp {
                     self.draw_engine_rack_block(&mut cols[1]);
                     self.draw_master_output_rack_block(&mut cols[2]);
                 });
+
+                if let Some(warn) = &self.resolution_warning.clone() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(Color32::from_rgb(251, 191, 36), warn);
+                        if ui.button("Cerrar aviso").clicked() {
+                            self.resolution_warning = None;
+                        }
+                    });
+                }
             });
     }
 
@@ -332,7 +423,9 @@ impl PedalboardApp {
             ui.add_space(4.0);
 
             let prev_host = self.selected_host;
-            let combo_w = (ui.available_width() - 180.0).clamp(130.0, 250.0);
+            let prev_buf = self.selected_buffer;
+            let prev_in = self.selected_input.clone();
+            let prev_ch = self.selected_in_channel;
 
             ui.horizontal_wrapped(|ui| {
                 ui.label("Host:");
@@ -367,19 +460,25 @@ impl PedalboardApp {
                 self.selected_input = None;
                 self.selected_output = None;
                 self.selected_in_channel = 0;
+                self.selected_proc_rate = None;
+                self.resolution_warning = None;
                 self.select_defaults_if_missing();
                 self.start_engine();
+                return;
             }
 
-            let in_names = self.input_device_names();
-            let in_label = truncate_label(
+            let in_devs = self.input_devices_with_rates();
+            let in_rate = self.selected_input_native_rate();
+            let in_label = format_dev_with_rate(
                 self.selected_input.as_deref().unwrap_or("(sin entrada)"),
-                28,
+                in_rate,
+                20,
             );
             let max_ch = self.max_input_channels();
             if self.selected_in_channel >= max_ch {
                 self.selected_in_channel = 0;
             }
+            let combo_w = (ui.available_width() - 125.0).clamp(120.0, 260.0);
 
             ui.horizontal_wrapped(|ui| {
                 ui.label("Disp:");
@@ -387,11 +486,12 @@ impl PedalboardApp {
                     .selected_text(in_label)
                     .width(combo_w)
                     .show_ui(ui, |ui| {
-                        for name in &in_names {
+                        for (name, rate) in &in_devs {
+                            let label = format_dev_with_rate(name, *rate, 36);
                             ui.selectable_value(
                                 &mut self.selected_input,
                                 Some(name.clone()),
-                                name,
+                                label,
                             );
                         }
                     });
@@ -410,9 +510,25 @@ impl PedalboardApp {
                     });
             });
 
-            #[cfg(feature = "asio")]
-            if self.selected_host == HostKind::Asio {
-                self.selected_output = self.selected_input.clone();
+            let changed_input = self.selected_input != prev_in;
+            if changed_input {
+                if let (Some(req_sr), Some(new_in_sr)) =
+                    (self.selected_proc_rate, self.selected_input_native_rate())
+                {
+                    if req_sr > new_in_sr {
+                        self.selected_proc_rate = None;
+                        self.resolution_warning = Some(format!(
+                            "Aviso: la resolución DSP bajó a nativa ({new_in_sr} Hz) porque la nueva entrada no alcanza {req_sr} Hz."
+                        ));
+                    }
+                }
+            }
+
+            if changed_input
+                || self.selected_in_channel != prev_ch
+                || self.selected_buffer != prev_buf
+            {
+                self.start_engine();
             }
 
             ui.add_space(6.0);
@@ -426,7 +542,7 @@ impl PedalboardApp {
             ui.set_min_height(132.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("⚙ MOTOR DE AUDIO")
+                    egui::RichText::new("⚙ MOTOR Y RESOLUCIÓN DSP")
                         .strong()
                         .size(13.5)
                         .color(Color32::from_rgb(203, 213, 225)),
@@ -439,7 +555,7 @@ impl PedalboardApp {
                     }
                 });
             });
-            ui.add_space(6.0);
+            ui.add_space(4.0);
 
             ui.horizontal_wrapped(|ui| {
                 let running = self.engine.is_some();
@@ -451,7 +567,7 @@ impl PedalboardApp {
                                 .strong()
                                 .color(Color32::WHITE),
                         )
-                        .min_size(Vec2::new(112.0, 30.0))
+                        .min_size(Vec2::new(108.0, 28.0))
                         .fill(Color32::from_rgb(22, 115, 72)),
                     )
                     .clicked()
@@ -463,7 +579,7 @@ impl PedalboardApp {
                     .add_enabled(
                         running,
                         egui::Button::new("⏹ Detener")
-                            .min_size(Vec2::new(92.0, 30.0))
+                            .min_size(Vec2::new(86.0, 28.0))
                             .fill(Color32::from_rgb(95, 42, 48)),
                     )
                     .clicked()
@@ -472,48 +588,106 @@ impl PedalboardApp {
                 }
 
                 if ui
-                    .add(
-                        egui::Button::new("🔍 Refrescar")
-                            .min_size(Vec2::new(96.0, 30.0)),
-                    )
+                    .add(egui::Button::new("🔍 Refrescar").min_size(Vec2::new(90.0, 28.0)))
                     .clicked()
                 {
                     self.refresh_devices();
                 }
             });
 
-            ui.add_space(6.0);
+            ui.add_space(4.0);
+
+            // Selector de Resolución de Procesado DSP (nunca puede superar a la entrada original)
+            let in_native_sr = self.selected_input_native_rate();
+            let mut candidate_rate = self.selected_proc_rate;
+            let rate_label = match (self.selected_proc_rate, in_native_sr) {
+                (None, Some(sr)) => format!("Nativa ({sr} Hz)"),
+                (None, None) => "Nativa (Auto)".to_string(),
+                (Some(sr), _) => format!("{sr} Hz"),
+            };
+
+            ui.horizontal(|ui| {
+                ui.label("Resolución DSP:");
+                egui::ComboBox::from_id_salt("proc_rate_select")
+                    .selected_text(rate_label)
+                    .width(155.0)
+                    .show_ui(ui, |ui| {
+                        for opt in PROC_RATE_OPTIONS {
+                            let label = match (opt, in_native_sr) {
+                                (None, Some(sr)) => format!("Nativa de entrada ({sr} Hz)"),
+                                (None, None) => "Nativa de entrada (Auto)".to_string(),
+                                (Some(sr), Some(max_sr)) if sr > max_sr => {
+                                    format!("{sr} Hz (bloqueado: > {max_sr} Hz)")
+                                }
+                                (Some(sr), _) => format!("{sr} Hz"),
+                            };
+                            ui.selectable_value(&mut candidate_rate, opt, label);
+                        }
+                    });
+            });
+
+            if candidate_rate != self.selected_proc_rate {
+                if let (Some(req_sr), Some(max_sr)) = (candidate_rate, in_native_sr) {
+                    if req_sr > max_sr {
+                        self.resolution_warning = Some(format!(
+                            "⚠ No permitido: {req_sr} Hz supera la resolución original de entrada ({max_sr} Hz). Cambia el muestreo en Windows si quieres subirlo."
+                        ));
+                    } else {
+                        self.resolution_warning = None;
+                        self.selected_proc_rate = candidate_rate;
+                        self.start_engine();
+                    }
+                } else {
+                    self.resolution_warning = None;
+                    self.selected_proc_rate = candidate_rate;
+                    self.start_engine();
+                }
+            }
+
+            ui.add_space(2.0);
 
             if let Some(err) = &self.last_error {
                 ui.colored_label(
                     Color32::from_rgb(248, 113, 113),
-                    truncate_label(&format!("Error: {err}"), 72),
+                    truncate_label(&format!("Error: {err}"), 70),
                 );
             } else if let Some(eng) = &self.engine {
                 let info = eng.info();
-                let sr_text = format_sample_rate(info);
+                let xruns = self.last_snapshot.underruns + self.last_snapshot.overflows;
+                if !info.is_resampling_input && !info.is_resampling_output {
+                    ui.colored_label(
+                        Color32::from_rgb(74, 222, 128),
+                        format!("✓ {} Hz nativa 1:1 (SIN RESAMPLEO)", info.processing_sample_rate),
+                    );
+                } else if info.is_resampling_output && !info.is_resampling_input {
+                    ui.colored_label(
+                        Color32::from_rgb(251, 191, 36),
+                        format!(
+                            "DSP: {} Hz → Salida: {} Hz (resampleo al final)",
+                            info.processing_sample_rate, info.output_sample_rate
+                        ),
+                    );
+                } else {
+                    ui.colored_label(
+                        Color32::from_rgb(251, 191, 36),
+                        format!(
+                            "In: {} Hz → DSP: {} Hz → Out: {} Hz",
+                            info.input_sample_rate,
+                            info.processing_sample_rate,
+                            info.output_sample_rate
+                        ),
+                    );
+                }
                 let in_b = info
                     .input_buffer_frames
                     .map_or("?".to_string(), |v| v.to_string());
                 let out_b = info
                     .output_buffer_frames
                     .map_or("?".to_string(), |v| v.to_string());
-                let xruns = self.last_snapshot.underruns + self.last_snapshot.overflows;
                 ui.label(
                     egui::RichText::new(format!(
-                        "Frecuencia: {sr_text}  ·  Latencia: {:.1} ms",
-                        info.estimated_latency_ms
-                    ))
-                    .size(12.5)
-                    .color(Color32::from_rgb(226, 232, 240)),
-                );
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Buffers: {in_b}/{out_b} + ring {} fr  ·  xruns: {xruns} (und:{}, ovf:{}, drift:{})",
-                        info.prefill_frames,
-                        self.last_snapshot.underruns,
-                        self.last_snapshot.overflows,
-                        self.last_snapshot.drift_drops,
+                        "Latencia: {:.1} ms  ·  Buf: {in_b}/{out_b}  ·  xruns: {xruns}",
+                        info.estimated_latency_ms,
                     ))
                     .size(11.5)
                     .color(Color32::from_rgb(148, 163, 184)),
@@ -543,7 +717,10 @@ impl PedalboardApp {
             });
             ui.add_space(4.0);
 
-            let out_names = self.output_device_names();
+            let out_devs = self.output_devices_with_rates();
+            let out_rate = self.selected_output_native_rate();
+            let prev_out = self.selected_output.clone();
+
             let is_asio = {
                 #[cfg(feature = "asio")]
                 {
@@ -554,18 +731,18 @@ impl PedalboardApp {
                     false
                 }
             };
-            let out_label = truncate_label(
+            let out_label = format_dev_with_rate(
                 self.selected_output.as_deref().unwrap_or("(sin salida)"),
-                24,
+                out_rate,
+                19,
             );
 
             ui.horizontal(|ui| {
-                // Izquierda: selector de salida, MUTE y vúmetro OUT
                 ui.vertical(|ui| {
                     let left_w = (ui.available_width() - 88.0).max(120.0);
                     ui.set_max_width(left_w);
 
-                    let combo_w = (left_w - 48.0).clamp(90.0, 240.0);
+                    let combo_w = (left_w - 48.0).clamp(90.0, 250.0);
                     ui.horizontal(|ui| {
                         ui.label("Disp:");
                         ui.add_enabled_ui(!is_asio, |ui| {
@@ -573,11 +750,12 @@ impl PedalboardApp {
                                 .selected_text(out_label)
                                 .width(combo_w)
                                 .show_ui(ui, |ui| {
-                                    for name in &out_names {
+                                    for (name, rate) in &out_devs {
+                                        let label = format_dev_with_rate(name, *rate, 34);
                                         ui.selectable_value(
                                             &mut self.selected_output,
                                             Some(name.clone()),
-                                            name,
+                                            label,
                                         );
                                     }
                                 });
@@ -614,7 +792,6 @@ impl PedalboardApp {
                     draw_level_meter(ui, "OUT", self.smooth_out_db, None, muted);
                 });
 
-                // Derecha: Perilla fija de Master Volume separada de los pedales
                 if let Some(master) = self.params.master_slot() {
                     if let Some(spec) = master.specs.first() {
                         let mut val = master.get(0);
@@ -637,18 +814,21 @@ impl PedalboardApp {
                     }
                 }
             });
+
+            if self.selected_output != prev_out {
+                self.start_engine();
+            }
         });
     }
 
     fn draw_cascade_board(&mut self, ui: &mut egui::Ui) {
         let central_frame = Frame::new()
             .fill(Color32::from_rgb(13, 16, 21))
-            .inner_margin(Margin::symmetric(16, 12));
+            .inner_margin(Margin::symmetric(14, 10));
 
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
-                // Posiciones de cascada de los pedales de efecto (excluye Master Volume)
                 let mut mounted_positions: Vec<usize> = Vec::new();
                 let mut unmounted_slots: Vec<(usize, &'static str, [u8; 3])> = Vec::new();
 
@@ -666,12 +846,12 @@ impl PedalboardApp {
                     }
                 }
 
-                // Barra de herramientas de la pedalera + menú Añadir / Quitar
+                // Barra de herramientas fija arriba de la zona desplazable
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         egui::RichText::new("PEDALERA EN CASCADA")
                             .strong()
-                            .size(15.5)
+                            .size(15.0)
                             .color(Color32::from_rgb(226, 232, 240)),
                     );
 
@@ -707,7 +887,10 @@ impl PedalboardApp {
                                 } else {
                                     format!("➕  {}  (Añadir)", slot.name)
                                 };
-                                let resp = ui.checkbox(&mut mounted, egui::RichText::new(label).color(Color32::from_rgb(r, g, b)));
+                                let resp = ui.checkbox(
+                                    &mut mounted,
+                                    egui::RichText::new(label).color(Color32::from_rgb(r, g, b)),
+                                );
                                 if resp.changed() {
                                     if mounted {
                                         self.params.move_slot_to_end(slot_idx);
@@ -719,7 +902,6 @@ impl PedalboardApp {
                         },
                     );
 
-                    // Botones rápidos de 1 clic para volver a poner pedales quitados
                     for (slot_idx, name, [r, g, b]) in &unmounted_slots {
                         if ui
                             .add(
@@ -748,19 +930,16 @@ impl PedalboardApp {
                     });
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(8.0);
 
-                // Cálculo responsivo pensado para 5-6 pedales sin scroll en 1920x1080
-                // y sin apretarse cuando la ventana es pequeña (mínimo 245 px de ancho por pedal).
-                let avail_h = ui.available_height();
-                let avail_w = ui.available_width();
-                let pedal_height = (avail_h - 28.0).clamp(320.0, 460.0);
-                let pedal_width = if avail_w >= 1750.0 {
-                    256.0
-                } else {
-                    248.0
-                };
-                let knob_scale = (pedal_height / 375.0).clamp(0.88, 1.15);
+                // Scroll bidireccional (vertical + horizontal) para que nunca se corte al achicar la ventana
+                let active_proc_sr = self
+                    .engine
+                    .as_ref()
+                    .map(|e| e.info().processing_sample_rate)
+                    .or(self.selected_proc_rate)
+                    .or_else(|| self.selected_input_native_rate())
+                    .unwrap_or(48_000);
 
                 let in_label = self
                     .selected_input
@@ -778,17 +957,28 @@ impl PedalboardApp {
                 let master_db = self.params.master_slot().map_or(-6.0, |m| m.get(0));
                 let sample_rate_label = self.engine.as_ref().map(|e| {
                     let i = e.info();
-                    if i.input_sample_rate != i.output_sample_rate {
-                        format!("{}→{} Hz", i.input_sample_rate, i.output_sample_rate)
+                    if i.is_resampling_input || i.is_resampling_output {
+                        format!("{}→{} Hz", i.processing_sample_rate, i.output_sample_rate)
                     } else {
-                        format!("{} Hz", i.sample_rate)
+                        format!("{} Hz", i.processing_sample_rate)
                     }
                 });
 
-                egui::ScrollArea::horizontal()
+                // Altura ajustada al contenido (sin espacio vacío innecesario)
+                let max_knobs = mounted_positions
+                    .iter()
+                    .filter_map(|&pos| self.params.slots().get(self.params.order_at(pos)))
+                    .map(|s| s.param_count())
+                    .max()
+                    .unwrap_or(1);
+                let max_knob_rows = max_knobs.div_ceil(3).max(1);
+                let pedal_height = 152.0 + max_knob_rows as f32 * 94.0;
+                let pedal_width = 250.0;
+
+                egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.horizontal_centered(|ui| {
+                        ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
 
                             draw_fixed_terminal(
@@ -806,34 +996,34 @@ impl PedalboardApp {
                                 active,
                             );
 
-                            draw_signal_arrow(ui, active);
+                            draw_signal_arrow(ui, pedal_height, active);
 
                             if mounted_positions.is_empty() {
                                 Frame::new()
                                     .fill(Color32::from_rgb(20, 24, 31))
                                     .corner_radius(CornerRadius::same(10))
                                     .stroke(Stroke::new(1.5, Color32::from_rgb(48, 56, 70)))
-                                    .inner_margin(Margin::same(24))
+                                    .inner_margin(Margin::same(16))
                                     .show(ui, |ui| {
-                                        ui.set_min_size(Vec2::new(300.0, pedal_height));
+                                        ui.set_min_size(Vec2::new(280.0, pedal_height));
                                         ui.vertical_centered(|ui| {
                                             ui.add_space(pedal_height * 0.3);
                                             ui.label(
                                                 egui::RichText::new("Sin pedales en la cadena")
                                                     .strong()
-                                                    .size(16.0)
+                                                    .size(15.5)
                                                     .color(Color32::from_rgb(180, 192, 208)),
                                             );
                                             ui.add_space(6.0);
                                             ui.label(
                                                 egui::RichText::new(
-                                                    "Señal directa hacia Master Volume. Usa 'Añadir Pedales' arriba.",
+                                                    "Señal directa hacia Master Volume.",
                                                 )
                                                 .color(Color32::from_rgb(125, 138, 156)),
                                             );
                                         });
                                     });
-                                draw_signal_arrow(ui, active && !muted);
+                                draw_signal_arrow(ui, pedal_height, active && !muted);
                             } else {
                                 let mounted_len = mounted_positions.len();
                                 for (m_idx, &cascade_pos) in mounted_positions.iter().enumerate() {
@@ -859,10 +1049,9 @@ impl PedalboardApp {
                                             slot,
                                             pedal_width,
                                             pedal_height,
-                                            knob_scale,
                                         );
                                     }
-                                    draw_signal_arrow(ui, active && !muted);
+                                    draw_signal_arrow(ui, pedal_height, active && !muted);
                                 }
                             }
 
@@ -884,6 +1073,9 @@ impl PedalboardApp {
                                 active && !muted,
                             );
                         });
+
+                        ui.add_space(12.0);
+                        self.analyzer.draw(ui, active_proc_sr);
                     });
             });
     }
@@ -891,7 +1083,7 @@ impl PedalboardApp {
 
 impl eframe::App for PedalboardApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.update_meters();
+        self.update_meters(ui.ctx());
         self.draw_studio_rack(ui);
         self.draw_cascade_board(ui);
         ui.ctx()
@@ -925,14 +1117,11 @@ fn rack_fixed_badge(ui: &mut egui::Ui, text: &str) {
         });
 }
 
-fn format_sample_rate(info: &EngineInfo) -> String {
-    if info.input_sample_rate != info.output_sample_rate {
-        format!(
-            "{} -> {} Hz (resampling)",
-            info.input_sample_rate, info.output_sample_rate
-        )
-    } else {
-        format!("{} Hz", info.sample_rate)
+fn format_dev_with_rate(name: &str, rate: Option<u32>, max_name_chars: usize) -> String {
+    let short = truncate_label(name, max_name_chars);
+    match rate {
+        Some(sr) if sr > 0 => format!("{short} [{sr} Hz]"),
+        _ => short,
     }
 }
 
@@ -1041,9 +1230,9 @@ fn draw_fixed_terminal(
             ui.set_max_size(Vec2::new(108.0, height));
             ui.vertical_centered(|ui| {
                 rack_fixed_badge(ui, "CHASSIS");
-                ui.add_space((height * 0.22).max(20.0));
+                ui.add_space((height * 0.18).max(16.0));
                 ui.label(egui::RichText::new(title).strong().size(13.5).color(accent));
-                ui.add_space(10.0);
+                ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(device_name)
                         .size(11.5)
@@ -1059,8 +1248,8 @@ fn draw_fixed_terminal(
         });
 }
 
-fn draw_signal_arrow(ui: &mut egui::Ui, active: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(20.0, 40.0), Sense::hover());
+fn draw_signal_arrow(ui: &mut egui::Ui, height: f32, active: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(20.0, height), Sense::hover());
     let color = if active {
         Color32::from_rgb(148, 163, 184)
     } else {
@@ -1099,7 +1288,6 @@ fn draw_stompbox_pedal(
     slot: &PedalParamSlot,
     pedal_width: f32,
     pedal_height: f32,
-    knob_scale: f32,
 ) {
     let [r, g, b] = slot.accent_color;
     let accent = Color32::from_rgb(r, g, b);
@@ -1121,7 +1309,7 @@ fn draw_stompbox_pedal(
         .fill(bg_color)
         .corner_radius(CornerRadius::same(12))
         .stroke(Stroke::new(2.0, border_color))
-        .inner_margin(Margin::same(12))
+        .inner_margin(Margin::same(10))
         .show(ui, |ui| {
             ui.set_min_size(Vec2::new(pedal_width, pedal_height));
             ui.set_max_size(Vec2::new(pedal_width, pedal_height));
@@ -1178,16 +1366,16 @@ fn draw_stompbox_pedal(
                         slot.set_mounted(false);
                     }
 
-                    let (led_rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                    let (led_rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
                     let c = led_rect.center();
                     let p = ui.painter();
                     if active {
-                        p.circle_filled(c, 9.0, Color32::from_rgba_unmultiplied(r, g, b, 65));
-                        p.circle_filled(c, 5.5, accent);
+                        p.circle_filled(c, 8.0, Color32::from_rgba_unmultiplied(r, g, b, 65));
+                        p.circle_filled(c, 5.0, accent);
                     } else {
                         p.circle(
                             c,
-                            5.5,
+                            5.0,
                             Color32::from_rgb(45, 50, 58),
                             Stroke::new(1.0, Color32::from_rgb(75, 82, 95)),
                         );
@@ -1195,12 +1383,12 @@ fn draw_stompbox_pedal(
                 });
             });
 
-            ui.add_space(6.0);
+            ui.add_space(2.0);
             ui.vertical_centered(|ui| {
                 ui.label(
                     egui::RichText::new(slot.name.to_uppercase())
                         .strong()
-                        .size(16.0)
+                        .size(15.0)
                         .color(if active {
                             Color32::from_rgb(241, 245, 249)
                         } else {
@@ -1209,39 +1397,35 @@ fn draw_stompbox_pedal(
                 );
             });
 
-            // Zona central de perillas: distribuida en filas de hasta 2 perillas
+            // Zona compacta de perillas: hasta 3 por fila para evitar alturas innecesarias
             let knob_count = slot.param_count();
-            let row_count = knob_count.div_ceil(2).max(1);
-            let single_knob_scale = if knob_count <= 2 {
-                (knob_scale * 1.12).min(1.22)
-            } else {
-                knob_scale * 0.94
-            };
-            let knob_h = 104.0 * single_knob_scale;
-            let row_gap = 6.0;
-            let knobs_total_h =
-                row_count as f32 * (knob_h + row_gap);
-            let footer_reserve = 78.0;
-            let content_h = (pedal_height - 24.0 - 54.0).max(200.0);
-            let extra_space = ((content_h - knobs_total_h - footer_reserve) * 0.42).max(6.0);
+            let knob_scale = if knob_count <= 2 { 0.92 } else { 0.80 };
+            let knob_w = 88.0 * knob_scale;
+            let knob_h = 104.0 * knob_scale;
+            let row_count = knob_count.div_ceil(3).max(1);
+            let row_gap = 4.0;
+            let knobs_total_h = row_count as f32 * (knob_h + row_gap);
+            let footer_reserve = 72.0;
+            let content_h = (pedal_height - 20.0 - 50.0).max(150.0);
+            let top_pad = ((content_h - knobs_total_h - footer_reserve) * 0.4).max(4.0);
 
-            ui.add_space(extra_space);
+            ui.add_space(top_pad);
 
             let indices: Vec<usize> = (0..knob_count).collect();
-            for row in indices.chunks(2) {
-                let knob_w = 88.0 * single_knob_scale;
-                let row_w = row.len() as f32 * knob_w + (row.len().saturating_sub(1) as f32) * 14.0;
-                let side_pad = ((pedal_width - 24.0 - row_w) * 0.5).max(0.0);
+            for row in indices.chunks(3) {
+                let item_gap = if row.len() == 3 { 6.0 } else { 14.0 };
+                let row_w = row.len() as f32 * knob_w + (row.len().saturating_sub(1) as f32) * item_gap;
+                let side_pad = ((pedal_width - 20.0 - row_w) * 0.5).max(0.0);
 
                 ui.horizontal(|ui| {
                     if side_pad > 0.0 {
                         ui.add_space(side_pad);
                     }
-                    ui.spacing_mut().item_spacing.x = 14.0;
+                    ui.spacing_mut().item_spacing.x = item_gap;
                     for &p_idx in row {
                         let spec = &slot.specs[p_idx];
                         let mut val = slot.get(p_idx);
-                        if draw_rotary_knob(ui, spec, &mut val, accent, active, single_knob_scale) {
+                        if draw_rotary_knob(ui, spec, &mut val, accent, active, knob_scale) {
                             slot.set(p_idx, val);
                         }
                     }
@@ -1249,11 +1433,10 @@ fn draw_stompbox_pedal(
                 ui.add_space(row_gap);
             }
 
-            // Empuja el footswitch hacia la base del pedal de manera uniforme
-            let bottom_pad = (content_h - extra_space - knobs_total_h - footer_reserve).max(6.0);
+            let bottom_pad = (content_h - top_pad - knobs_total_h - footer_reserve).max(4.0);
             ui.add_space(bottom_pad);
 
-            // Zona inferior: Footswitch + Reset con tamaño cómodo
+            // Zona inferior compacta: Footswitch + Reset alineados
             ui.vertical_centered(|ui| {
                 let switch_text = if active { "● ACTIVO" } else { "○ BYPASS" };
                 let switch_fill = if active {
@@ -1264,20 +1447,20 @@ fn draw_stompbox_pedal(
                 let switch_btn = egui::Button::new(
                     egui::RichText::new(switch_text)
                         .strong()
-                        .size(14.0)
+                        .size(13.5)
                         .color(Color32::WHITE),
                 )
-                .min_size(Vec2::new(150.0, 38.0))
-                .corner_radius(CornerRadius::same(19))
+                .min_size(Vec2::new(146.0, 34.0))
+                .corner_radius(CornerRadius::same(17))
                 .fill(switch_fill);
 
                 if ui.add(switch_btn).clicked() {
                     slot.set_bypass(!bypass);
                 }
 
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 if ui
-                    .add(egui::Button::new("↺ Reset").min_size(Vec2::new(82.0, 26.0)))
+                    .add(egui::Button::new("↺ Reset").min_size(Vec2::new(78.0, 24.0)))
                     .on_hover_text("Restaurar valores por defecto de este pedal")
                     .clicked()
                 {
@@ -1346,7 +1529,7 @@ fn draw_rotary_knob(
             Pos2::new(rect.center().x, rect.min.y + 11.0 * scale),
             Align2::CENTER_CENTER,
             spec.name,
-            FontId::proportional(13.0 * scale.min(1.1)),
+            FontId::proportional((13.0 * scale).max(11.0)),
             title_color,
         );
 
@@ -1407,7 +1590,7 @@ fn draw_rotary_knob(
             Pos2::new(rect.center().x, rect.max.y - 12.0 * scale),
             Align2::CENTER_CENTER,
             spec.format_value(*value),
-            FontId::monospace(12.0 * scale.min(1.1)),
+            FontId::monospace((12.0 * scale).max(10.5)),
             if enabled {
                 Color32::from_rgb(226, 232, 240)
             } else {
