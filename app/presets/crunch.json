@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "name": "Crunch",
+  "author": "libre-pedals",
+  "description": "Overdrive moderado para rítmicas y blues",
+  "chain": [
+    {
+      "id": "noise_gate-1",
+      "pedal": "noise_gate",
+      "enabled": true,
+      "params": {
+        "threshold_db": -60.0
+      }
+    },
+    {
+      "id": "overdrive-1",
+      "pedal": "overdrive",
+      "enabled": true,
+      "params": {
+        "drive_db": 14.0,
+        "tone_hz": 3500.0,
+        "level_db": -8.0
+      }
+    }
+  ],
+  "preset_level_db": 0.0
+}

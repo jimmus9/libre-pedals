@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "name": "Clean",
+  "author": "libre-pedals",
+  "description": "Señal limpia con puerta de ruido suave",
+  "chain": [
+    {
+      "id": "noise_gate-1",
+      "pedal": "noise_gate",
+      "enabled": true,
+      "params": {
+        "threshold_db": -65.0
+      }
+    }
+  ],
+  "preset_level_db": 0.0
+}

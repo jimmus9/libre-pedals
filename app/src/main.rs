@@ -1,5 +1,7 @@
 mod analyzer_ui;
 mod gui;
+mod presets;
+mod settings;
 
 use std::{
     io::{self, Write},
@@ -32,6 +34,8 @@ enum Command {
     Gui(GuiArgs),
     /// Lista los hosts, dispositivos de audio y configuraciones soportadas
     List,
+    /// Lista los presets de fábrica y de usuario disponibles
+    Presets,
     /// Inicia el procesamiento de audio por consola en tiempo real
     Run(RunArgs),
 }
@@ -122,6 +126,10 @@ struct RunArgs {
     /// Desactiva (bypass) el noise gate
     #[arg(long = "bypass-gate", default_value_t = false)]
     bypass_gate: bool,
+
+    /// Nombre o ruta JSON del preset a cargar
+    #[arg(long)]
+    preset: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -132,6 +140,7 @@ fn main() -> Result<()> {
     {
         Command::Gui(args) => cmd_gui(args),
         Command::List => cmd_list(),
+        Command::Presets => cmd_presets(),
         Command::Run(args) => cmd_run(args),
     }
 }
@@ -203,6 +212,26 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
+fn cmd_presets() -> Result<()> {
+    println!("=== Presets de fábrica ===");
+    for &(name, _) in presets::FACTORY {
+        println!("  - {name}");
+    }
+
+    let dir = presets::user_presets_dir()?;
+    let user = presets::list_user_presets();
+    println!("\n=== Presets de usuario ({}) ===", dir.display());
+    if user.is_empty() {
+        println!("  (Ningún preset de usuario guardado todavía)");
+    } else {
+        for (name, path) in user {
+            println!("  - {name} ({})", path.display());
+        }
+    }
+
+    Ok(())
+}
+
 fn resolve_host_kind(arg: HostArg) -> Result<HostKind> {
     match arg {
         HostArg::Wasapi => Ok(HostKind::Wasapi),
@@ -237,6 +266,15 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     };
 
     let params = Arc::new(Params::from_initial(init));
+    if let Some(ref preset_arg) = args.preset {
+        let preset = presets::resolve_preset(preset_arg)?;
+        let warnings = preset.apply(&params);
+        for w in warnings {
+            eprintln!("Aviso preset: {w}");
+        }
+        // `--volume` controla el Master global fuera del preset.
+        params.set_volume_db(args.volume);
+    }
     let meters = Arc::new(Meters::new());
 
     let engine = Engine::start(EngineConfig {
@@ -282,16 +320,40 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         info.prefill_frames
     );
     println!("Latencia est.:  {:.2} ms", info.estimated_latency_ms);
+    let mut chain_parts: Vec<String> = Vec::new();
+    for slot_idx in params.mounted_cascade() {
+        if let Some(slot) = params.slots().get(slot_idx) {
+            let p_str: Vec<String> = slot
+                .specs
+                .iter()
+                .enumerate()
+                .map(|(i, sp)| format!("{} {}", sp.name, sp.format_value(slot.get(i))))
+                .collect();
+            let bypass_tag = if slot.bypass() { ", BYPASS" } else { "" };
+            chain_parts.push(format!(
+                "{} ({}{})",
+                slot.display_name(),
+                p_str.join(", "),
+                bypass_tag
+            ));
+        }
+    }
+    chain_parts.push(format!("Master ({:.1} dB)", params.volume_db()));
+    let preset_lvl = params.preset_level_db();
+    let lvl_tag = if preset_lvl.abs() > 0.05 {
+        format!(" [nivel preset: {preset_lvl:+.1} dB]")
+    } else {
+        String::new()
+    };
     println!(
-        "Cadena DSP:     NoiseGate ({:.1} dB{}) -> Overdrive (drive {:.1} dB, tone {:.0} Hz, level {:.1} dB{}) -> Volume ({:.1} dB){}",
-        args.gate,
-        if args.bypass_gate { ", BYPASS" } else { "" },
-        args.drive,
-        args.tone,
-        args.level,
-        if args.bypass_drive { ", BYPASS" } else { "" },
-        args.volume,
-        if args.mute { " [SALIDA SILENCIADA / MUTE]" } else { "" }
+        "Cadena DSP:     {}{}{}",
+        chain_parts.join(" -> "),
+        lvl_tag,
+        if args.mute {
+            " [SALIDA SILENCIADA / MUTE]"
+        } else {
+            ""
+        }
     );
     println!("Presiona Ctrl+C para detener.\n");
 

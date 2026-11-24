@@ -1,6 +1,7 @@
 use crate::{db_to_lin, sanitize_sample, Effect, ParamScale, ParamSpec};
 
 const GAIN_PARAMS: [ParamSpec; 1] = [ParamSpec {
+    id: "volume_db",
     name: "Volume",
     unit: "dB",
     min: -60.0,
@@ -60,6 +61,10 @@ impl Gain {
 }
 
 impl Effect for Gain {
+    fn kind(&self) -> &'static str {
+        "master_volume"
+    }
+
     fn name(&self) -> &'static str {
         "Master Volume"
     }

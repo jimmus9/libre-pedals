@@ -1,5 +1,6 @@
 pub mod devices;
 pub mod params;
+pub mod preset;
 
 use std::sync::{
     atomic::{AtomicU32, Ordering},
@@ -12,11 +13,15 @@ use cpal::{
     BufferSize, Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
     SupportedBufferSize, SupportedStreamConfig,
 };
-use dsp::{Chain, Effect, Gain, NoiseGate, Overdrive, Resampler};
+use dsp::{db_to_lin, Chain, Effect, Gain, NoiseGate, Overdrive, Resampler};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 pub use devices::{list_devices, ConfigSummary, DeviceReport, HostKind, HostReport};
-pub use params::{InitialParams, MeterSnapshot, Meters, Params, PedalParamSlot};
+pub use params::{
+    InitialParams, KindInfo, MeterSnapshot, Meters, Params, PedalParamSlot, MAX_INSTANCES_PER_KIND,
+    MAX_MOUNTED_PEDALS, PRESET_LEVEL_MAX_DB, PRESET_LEVEL_MIN_DB,
+};
+pub use preset::{Preset, PresetPedal, PRESET_FORMAT_VERSION};
 
 const SCRATCH_FRAMES: usize = 8192;
 const MICRO_BLOCK_FRAMES: usize = 64;
@@ -456,14 +461,42 @@ where
     best
 }
 
-/// Crea la cadena de pedales por defecto. Para agregar nuevos efectos en el futuro
-/// basta con empujarlos aquí; la UI y los parámetros atómicos se generan automáticamente.
+/// Crea la cadena de pedales por defecto prealojando hasta `MAX_INSTANCES_PER_KIND` copias
+/// por tipo de pedal y un `Master Volume` fijo al final.
 pub fn default_pedalboard_chain() -> Chain {
     let mut chain = Chain::new();
-    chain.push(NoiseGate::new(-60.0), false);
-    chain.push(Overdrive::new(), false);
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(NoiseGate::new(-60.0), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(Overdrive::new(), false);
+    }
     chain.push(Gain::new(-6.0), false);
     chain
+}
+
+#[inline]
+fn apply_level_ramp(block: &mut [f32], current_gain: &mut f32, target_gain: f32) {
+    if block.is_empty() {
+        return;
+    }
+    if (*current_gain - target_gain).abs() < 1e-6 {
+        *current_gain = target_gain;
+        if (target_gain - 1.0).abs() > 1e-6 {
+            for s in block.iter_mut() {
+                *s *= target_gain;
+            }
+        }
+        return;
+    }
+    let len = block.len() as f32;
+    let start = *current_gain;
+    let delta = target_gain - start;
+    for (i, s) in block.iter_mut().enumerate() {
+        let t = (i + 1) as f32 / len;
+        *s *= start + delta * t;
+    }
+    *current_gain = target_gain;
 }
 
 fn build_pedalboard_chain(params: &Params) -> Chain {
@@ -709,6 +742,7 @@ where
     let mut out_resampler = Resampler::new(proc_sample_rate, out_sample_rate);
     let mut fifo_buf = vec![0.0_f32; 16_384];
     let mut fifo_len = 0usize;
+    let mut level_gain = db_to_lin(params.preset_level_db());
     let meters_err = Arc::clone(&meters);
 
     let stream = dev.build_output_stream(
@@ -764,6 +798,7 @@ where
                     }
 
                     chain.process(block);
+                    apply_level_ramp(block, &mut level_gain, db_to_lin(params.preset_level_db()));
 
                     for (i, (&pre, &post)) in pre_block.iter().zip(block.iter()).enumerate() {
                         let _ = analysis_producer.push((pre, post));
@@ -802,6 +837,7 @@ where
                     }
 
                     chain.process(block);
+                    apply_level_ramp(block, &mut level_gain, db_to_lin(params.preset_level_db()));
 
                     for (&pre, &post) in pre_block.iter().zip(block.iter()) {
                         let _ = analysis_producer.push((pre, post));

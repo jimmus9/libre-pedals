@@ -1,0 +1,39 @@
+{
+  "format_version": 1,
+  "name": "Lead (Boost + Drive)",
+  "author": "libre-pedals",
+  "description": "Doble overdrive en cascada: Boost empujando a Drive",
+  "chain": [
+    {
+      "id": "noise_gate-1",
+      "pedal": "noise_gate",
+      "enabled": true,
+      "params": {
+        "threshold_db": -55.0
+      }
+    },
+    {
+      "id": "overdrive-1",
+      "pedal": "overdrive",
+      "label": "Boost",
+      "enabled": true,
+      "params": {
+        "drive_db": 4.0,
+        "tone_hz": 7000.0,
+        "level_db": 6.0
+      }
+    },
+    {
+      "id": "overdrive-2",
+      "pedal": "overdrive",
+      "label": "Drive",
+      "enabled": true,
+      "params": {
+        "drive_db": 26.0,
+        "tone_hz": 4200.0,
+        "level_db": -14.0
+      }
+    }
+  ],
+  "preset_level_db": -2.0
+}

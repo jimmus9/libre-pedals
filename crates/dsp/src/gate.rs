@@ -1,6 +1,7 @@
 use crate::{db_to_lin, sanitize_sample, Effect, ParamScale, ParamSpec};
 
 const GATE_PARAMS: [ParamSpec; 1] = [ParamSpec {
+    id: "threshold_db",
     name: "Threshold",
     unit: "dB",
     min: -100.0,
@@ -63,6 +64,10 @@ impl NoiseGate {
 }
 
 impl Effect for NoiseGate {
+    fn kind(&self) -> &'static str {
+        "noise_gate"
+    }
+
     fn name(&self) -> &'static str {
         "Noise Gate"
     }

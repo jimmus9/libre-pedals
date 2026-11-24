@@ -1,4 +1,5 @@
 use std::{
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,10 +11,17 @@ use eframe::egui::{
 };
 use engine::{
     list_devices, Engine, EngineConfig, HostKind, HostReport, InitialParams, MeterSnapshot, Meters,
-    Params, PedalParamSlot,
+    Params, PedalParamSlot, Preset, MAX_MOUNTED_PEDALS, PRESET_LEVEL_MAX_DB, PRESET_LEVEL_MIN_DB,
 };
 
-use crate::analyzer_ui::AnalyzerState;
+use crate::{
+    analyzer_ui::AnalyzerState,
+    presets::{
+        delete_user_preset, list_user_presets, load_factory_preset, resolve_preset,
+        save_user_preset, user_presets_dir, FACTORY,
+    },
+    settings::{host_from_str, host_to_string, PresetRef, Settings},
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct GuiStartOptions {
@@ -84,18 +92,66 @@ struct PedalboardApp {
     smooth_in_db: f32,
     smooth_out_db: f32,
     last_frame_time: Instant,
+
+    settings_saved: Settings,
+    settings_dirty_since: Option<Instant>,
+    current_preset: Option<PresetRef>,
+    loaded_snapshot: Option<Preset>,
+    user_presets: Vec<(String, PathBuf)>,
+    preset_status: Option<String>,
+    preset_warnings: Vec<String>,
+    save_as_name: Option<String>,
+    confirm_overwrite: Option<String>,
+    confirm_delete: Option<(String, PathBuf)>,
+    pending_switch: Option<PresetRef>,
 }
 
 impl PedalboardApp {
     fn new(opts: GuiStartOptions) -> Self {
         let reports = list_devices();
-        let selected_host = opts.host.unwrap_or(HostKind::Wasapi);
+        let settings = Settings::load();
+        let selected_host = opts
+            .host
+            .or_else(|| host_from_str(settings.host.as_deref()))
+            .unwrap_or(HostKind::Wasapi);
+        let selected_input = opts.input.or_else(|| settings.input.clone());
+        let selected_output = opts.output.or_else(|| settings.output.clone());
+        let selected_in_channel = settings.in_channel;
+        let selected_buffer = settings.buffer_frames;
+        let selected_proc_rate = settings.processing_sample_rate;
+
         let init = InitialParams {
             mute: opts.mute,
+            volume_db: settings
+                .master_volume_db
+                .unwrap_or(InitialParams::default().volume_db),
             ..Default::default()
         };
         let params = Arc::new(Params::from_initial(init));
         let meters = Arc::new(Meters::new());
+        let user_presets = list_user_presets();
+
+        let mut current_preset = None;
+        let mut loaded_snapshot = None;
+        let mut preset_status = None;
+        let mut preset_warnings = Vec::new();
+
+        if let Some(ref pref) = settings.last_preset {
+            let loaded = load_preset_from_ref(pref, &user_presets);
+            match loaded {
+                Ok(preset) => {
+                    preset_warnings = preset.apply(&params);
+                    loaded_snapshot = Some(Preset::capture(&params, &preset.name));
+                    current_preset = Some(pref.clone());
+                }
+                Err(err) => {
+                    preset_status = Some(format!(
+                        "No se pudo restaurar el último preset '{}': {err}",
+                        pref.name
+                    ));
+                }
+            }
+        }
 
         let mut app = Self {
             params,
@@ -104,11 +160,11 @@ impl PedalboardApp {
             reports,
             analyzer: AnalyzerState::new(),
             selected_host,
-            selected_input: opts.input,
-            selected_output: opts.output,
-            selected_in_channel: 0,
-            selected_buffer: None,
-            selected_proc_rate: None,
+            selected_input,
+            selected_output,
+            selected_in_channel,
+            selected_buffer,
+            selected_proc_rate,
             last_error: None,
             resolution_warning: None,
             last_snapshot: MeterSnapshot {
@@ -124,6 +180,17 @@ impl PedalboardApp {
             smooth_in_db: -120.0,
             smooth_out_db: -120.0,
             last_frame_time: Instant::now(),
+            settings_saved: settings,
+            settings_dirty_since: None,
+            current_preset,
+            loaded_snapshot,
+            user_presets,
+            preset_status,
+            preset_warnings,
+            save_as_name: None,
+            confirm_overwrite: None,
+            confirm_delete: None,
+            pending_switch: None,
         };
 
         app.select_defaults_if_missing();
@@ -384,11 +451,479 @@ impl PedalboardApp {
             self.smooth_in_db = -120.0;
             self.smooth_out_db = -120.0;
         }
+
+        self.maybe_save_settings();
+    }
+
+    fn current_settings(&self) -> Settings {
+        Settings {
+            host: Some(host_to_string(self.selected_host)),
+            input: self.selected_input.clone(),
+            output: self.selected_output.clone(),
+            in_channel: self.selected_in_channel,
+            buffer_frames: self.selected_buffer,
+            processing_sample_rate: self.selected_proc_rate,
+            master_volume_db: Some(self.params.volume_db()),
+            last_preset: self.current_preset.clone(),
+        }
+    }
+
+    fn maybe_save_settings(&mut self) {
+        let current = self.current_settings();
+        if current != self.settings_saved {
+            let now = Instant::now();
+            match self.settings_dirty_since {
+                None => self.settings_dirty_since = Some(now),
+                Some(since) if now.duration_since(since) >= Duration::from_secs(1) => {
+                    if let Err(err) = current.save() {
+                        eprintln!("Aviso al guardar settings.json: {err}");
+                    } else {
+                        self.settings_saved = current;
+                    }
+                    self.settings_dirty_since = None;
+                }
+                _ => {}
+            }
+        } else {
+            self.settings_dirty_since = None;
+        }
+    }
+
+    fn is_preset_dirty(&self) -> bool {
+        let Some(ref snap) = self.loaded_snapshot else {
+            return false;
+        };
+        !Preset::capture(&self.params, &snap.name).same_sound(snap)
+    }
+
+    fn all_preset_refs(&self) -> Vec<PresetRef> {
+        let mut list: Vec<PresetRef> = FACTORY
+            .iter()
+            .map(|&(name, _)| PresetRef {
+                source: "factory".to_string(),
+                name: name.to_string(),
+            })
+            .collect();
+        for (name, _) in &self.user_presets {
+            list.push(PresetRef {
+                source: "user".to_string(),
+                name: name.clone(),
+            });
+        }
+        list
+    }
+
+    fn request_load_preset(&mut self, pref: PresetRef) {
+        if self.current_preset.as_ref() == Some(&pref) && !self.is_preset_dirty() {
+            return;
+        }
+        if self.is_preset_dirty() {
+            self.pending_switch = Some(pref);
+        } else {
+            self.apply_preset_ref(&pref);
+        }
+    }
+
+    fn apply_preset_ref(&mut self, pref: &PresetRef) {
+        match load_preset_from_ref(pref, &self.user_presets) {
+            Ok(preset) => {
+                self.preset_warnings = preset.apply(&self.params);
+                self.preset_status = None;
+                self.loaded_snapshot = Some(Preset::capture(&self.params, &preset.name));
+                self.current_preset = Some(pref.clone());
+            }
+            Err(err) => {
+                self.preset_status = Some(format!("Error al cargar preset '{}': {err}", pref.name));
+            }
+        }
+    }
+
+    fn save_preset_with_name(&mut self, name: &str) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            self.preset_status = Some("Escribe un nombre válido para el preset.".to_string());
+            return;
+        }
+        let preset = Preset::capture(&self.params, trimmed);
+        match save_user_preset(&preset) {
+            Ok(_) => {
+                self.user_presets = list_user_presets();
+                self.current_preset = Some(PresetRef {
+                    source: "user".to_string(),
+                    name: trimmed.to_string(),
+                });
+                self.loaded_snapshot = Some(preset);
+                self.preset_status = None;
+                self.preset_warnings.clear();
+            }
+            Err(err) => {
+                self.preset_status = Some(format!("Error al guardar preset: {err}"));
+            }
+        }
+    }
+
+    fn draw_preset_bar(&mut self, ui: &mut egui::Ui) {
+        let bar_frame = Frame::new()
+            .fill(Color32::from_rgb(14, 17, 23))
+            .inner_margin(Margin::symmetric(14, 6))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(34, 41, 54)));
+
+        egui::Panel::top("preset_bar")
+            .frame(bar_frame)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("PRESET")
+                            .strong()
+                            .size(13.0)
+                            .color(Color32::from_rgb(148, 163, 184)),
+                    );
+
+                    let all_refs = self.all_preset_refs();
+                    let current_idx = self
+                        .current_preset
+                        .as_ref()
+                        .and_then(|cur| all_refs.iter().position(|r| r == cur));
+
+                    if ui
+                        .add_enabled(
+                            !all_refs.is_empty(),
+                            egui::Button::new("◀").min_size(Vec2::new(28.0, 26.0)),
+                        )
+                        .on_hover_text("Preset anterior")
+                        .clicked()
+                    {
+                        let next_idx = match current_idx {
+                            Some(i) => (i + all_refs.len() - 1) % all_refs.len(),
+                            None => all_refs.len() - 1,
+                        };
+                        self.request_load_preset(all_refs[next_idx].clone());
+                    }
+
+                    let selected_label = match &self.current_preset {
+                        Some(p) if p.source == "factory" => format!("🏭 {}", p.name),
+                        Some(p) => p.name.clone(),
+                        None => "(Personalizado / Sin preset)".to_string(),
+                    };
+
+                    let mut clicked_ref: Option<PresetRef> = None;
+                    egui::ComboBox::from_id_salt("preset_select")
+                        .selected_text(selected_label)
+                        .width(210.0)
+                        .show_ui(ui, |ui| {
+                            for &(name, _) in FACTORY {
+                                let candidate = PresetRef {
+                                    source: "factory".to_string(),
+                                    name: name.to_string(),
+                                };
+                                let selected = self.current_preset.as_ref() == Some(&candidate);
+                                if ui
+                                    .selectable_label(selected, format!("🏭 {name}"))
+                                    .clicked()
+                                {
+                                    clicked_ref = Some(candidate);
+                                }
+                            }
+                            if !self.user_presets.is_empty() {
+                                ui.separator();
+                                for (name, _) in &self.user_presets {
+                                    let candidate = PresetRef {
+                                        source: "user".to_string(),
+                                        name: name.clone(),
+                                    };
+                                    let selected = self.current_preset.as_ref() == Some(&candidate);
+                                    if ui.selectable_label(selected, name).clicked() {
+                                        clicked_ref = Some(candidate);
+                                    }
+                                }
+                            }
+                        });
+                    if let Some(pref) = clicked_ref {
+                        self.request_load_preset(pref);
+                    }
+
+                    if ui
+                        .add_enabled(
+                            !all_refs.is_empty(),
+                            egui::Button::new("▶").min_size(Vec2::new(28.0, 26.0)),
+                        )
+                        .on_hover_text("Siguiente preset")
+                        .clicked()
+                    {
+                        let next_idx = match current_idx {
+                            Some(i) => (i + 1) % all_refs.len(),
+                            None => 0,
+                        };
+                        self.request_load_preset(all_refs[next_idx].clone());
+                    }
+
+                    if self.is_preset_dirty() {
+                        ui.label(
+                            egui::RichText::new("●")
+                                .strong()
+                                .size(15.0)
+                                .color(Color32::from_rgb(251, 191, 36)),
+                        )
+                        .on_hover_text("Cambios sin guardar");
+                    }
+
+                    if ui
+                        .add(egui::Button::new("💾 Guardar").min_size(Vec2::new(88.0, 26.0)))
+                        .clicked()
+                    {
+                        if let Some(ref cur) = self.current_preset {
+                            if cur.source == "user" {
+                                let name = cur.name.clone();
+                                self.save_preset_with_name(&name);
+                            } else {
+                                self.save_as_name = Some(format!("{} (copia)", cur.name));
+                            }
+                        } else {
+                            self.save_as_name = Some("Mi Preset".to_string());
+                        }
+                    }
+
+                    if ui
+                        .add(egui::Button::new("Guardar como…").min_size(Vec2::new(112.0, 26.0)))
+                        .clicked()
+                    {
+                        let suggested = self
+                            .current_preset
+                            .as_ref()
+                            .map(|p| p.name.clone())
+                            .unwrap_or_else(|| "Mi Preset".to_string());
+                        self.save_as_name = Some(suggested);
+                    }
+
+                    let user_path = self.current_preset.as_ref().and_then(|cur| {
+                        if cur.source == "user" {
+                            self.user_presets
+                                .iter()
+                                .find(|(n, _)| n.eq_ignore_ascii_case(&cur.name))
+                                .map(|(n, p)| (n.clone(), p.clone()))
+                        } else {
+                            None
+                        }
+                    });
+                    if ui
+                        .add_enabled(
+                            user_path.is_some(),
+                            egui::Button::new("🗑 Eliminar").min_size(Vec2::new(88.0, 26.0)),
+                        )
+                        .on_hover_text("Eliminar el preset de usuario activo")
+                        .clicked()
+                    {
+                        if let Some(pair) = user_path {
+                            self.confirm_delete = Some(pair);
+                        }
+                    }
+
+                    if ui
+                        .add(egui::Button::new("📂 Carpeta").min_size(Vec2::new(86.0, 26.0)))
+                        .on_hover_text("Abrir la carpeta de presets de usuario")
+                        .clicked()
+                    {
+                        match user_presets_dir() {
+                            Ok(dir) => {
+                                if let Err(err) =
+                                    std::process::Command::new("explorer").arg(&dir).spawn()
+                                {
+                                    self.preset_status = Some(format!(
+                                        "No se pudo abrir '{}': {err}",
+                                        dir.display()
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                self.preset_status = Some(format!("{err}"));
+                            }
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label("Nivel:");
+                    let mut lvl = self.params.preset_level_db();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut lvl)
+                                .range(PRESET_LEVEL_MIN_DB..=PRESET_LEVEL_MAX_DB)
+                                .speed(0.1)
+                                .max_decimals(1)
+                                .suffix(" dB"),
+                        )
+                        .on_hover_text("Nivel propio del preset (el Master permanece fijo)")
+                        .changed()
+                    {
+                        self.params.set_preset_level_db(lvl);
+                    }
+                });
+
+                if !self.preset_warnings.is_empty() || self.preset_status.is_some() {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let mut parts = Vec::new();
+                        if let Some(ref st) = self.preset_status {
+                            parts.push(st.clone());
+                        }
+                        parts.extend(self.preset_warnings.iter().cloned());
+                        ui.colored_label(
+                            Color32::from_rgb(251, 191, 36),
+                            format!("⚠ {}", parts.join(" · ")),
+                        );
+                        if ui.button("Cerrar").clicked() {
+                            self.preset_status = None;
+                            self.preset_warnings.clear();
+                        }
+                    });
+                }
+            });
+    }
+
+    fn draw_preset_dialogs(&mut self, ui: &mut egui::Ui) {
+        if let Some(mut name_buf) = self.save_as_name.take() {
+            let mut keep_open = true;
+            let mut submit = false;
+            egui::Window::new("Guardar preset como")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Nombre del preset:");
+                    let te = ui.text_edit_singleline(&mut name_buf);
+                    if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Guardar").clicked() {
+                            submit = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            keep_open = false;
+                        }
+                    });
+                });
+
+            if submit {
+                let trimmed = name_buf.trim().to_string();
+                if trimmed.is_empty() {
+                    self.preset_status = Some("El nombre no puede estar vacío.".to_string());
+                    self.save_as_name = Some(name_buf);
+                } else if self
+                    .user_presets
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(&trimmed))
+                {
+                    self.confirm_overwrite = Some(trimmed);
+                } else {
+                    self.save_preset_with_name(&trimmed);
+                }
+            } else if keep_open {
+                self.save_as_name = Some(name_buf);
+            }
+        }
+
+        if let Some(name) = self.confirm_overwrite.take() {
+            let mut keep_open = true;
+            egui::Window::new("Confirmar sobrescritura")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Ya existe un preset llamado '{name}'. ¿Deseas sobrescribirlo?"
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Sobrescribir").clicked() {
+                            self.save_preset_with_name(&name);
+                            keep_open = false;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            self.save_as_name = Some(name.clone());
+                            keep_open = false;
+                        }
+                    });
+                });
+            if keep_open {
+                self.confirm_overwrite = Some(name);
+            }
+        }
+
+        if let Some((name, path)) = self.confirm_delete.take() {
+            let mut keep_open = true;
+            egui::Window::new("Eliminar preset")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "¿Eliminar el preset '{name}'? Esta acción no se puede deshacer."
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Eliminar").clicked() {
+                            match delete_user_preset(&path) {
+                                Ok(()) => {
+                                    self.user_presets = list_user_presets();
+                                    if self
+                                        .current_preset
+                                        .as_ref()
+                                        .is_some_and(|c| c.source == "user" && c.name == name)
+                                    {
+                                        self.current_preset = None;
+                                        self.loaded_snapshot = None;
+                                    }
+                                    self.preset_status = None;
+                                }
+                                Err(err) => {
+                                    self.preset_status =
+                                        Some(format!("Error al eliminar preset: {err}"));
+                                }
+                            }
+                            keep_open = false;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            keep_open = false;
+                        }
+                    });
+                });
+            if keep_open {
+                self.confirm_delete = Some((name, path));
+            }
+        }
+
+        if let Some(target) = self.pending_switch.take() {
+            let mut keep_open = true;
+            egui::Window::new("Cambios sin guardar")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "El preset actual tiene cambios sin guardar. ¿Descartarlos y cargar '{}'?",
+                        target.name
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Descartar y cambiar").clicked() {
+                            self.apply_preset_ref(&target);
+                            keep_open = false;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            keep_open = false;
+                        }
+                    });
+                });
+            if keep_open {
+                self.pending_switch = Some(target);
+            }
+        }
     }
 
     fn active_gate_threshold_db(&self) -> Option<f32> {
         for slot in self.params.slots() {
-            if slot.name == "Noise Gate" && slot.is_mounted() && !slot.bypass() {
+            if slot.kind == "noise_gate" && slot.is_mounted() && !slot.bypass() {
                 let th = slot.get(0);
                 if th > -100.0 {
                     return Some(th);
@@ -849,8 +1384,6 @@ impl PedalboardApp {
             .frame(central_frame)
             .show(ui, |ui| {
                 let mut mounted_positions: Vec<usize> = Vec::new();
-                let mut unmounted_slots: Vec<(usize, &'static str, [u8; 3])> = Vec::new();
-
                 for pos in 0..self.params.slot_count() {
                     let slot_idx = self.params.order_at(pos);
                     if let Some(slot) = self.params.slots().get(slot_idx) {
@@ -859,11 +1392,8 @@ impl PedalboardApp {
                         }
                     }
                 }
-                for (slot_idx, slot) in self.params.slots().iter().enumerate() {
-                    if !slot.is_master && !slot.is_mounted() {
-                        unmounted_slots.push((slot_idx, slot.name, slot.accent_color));
-                    }
-                }
+                let kinds = self.params.kinds();
+                let total_mounted = mounted_positions.len();
 
                 // Barra de herramientas fija arriba de la zona desplazable
                 ui.horizontal_wrapped(|ui| {
@@ -875,7 +1405,7 @@ impl PedalboardApp {
                     );
 
                     ui.label(
-                        egui::RichText::new(format!("({} en cadena)", mounted_positions.len()))
+                        egui::RichText::new(format!("({} en cadena)", total_mounted))
                             .size(13.0)
                             .color(Color32::from_rgb(148, 163, 184)),
                     );
@@ -887,54 +1417,91 @@ impl PedalboardApp {
                             .strong()
                             .size(13.5),
                         |ui| {
-                            ui.set_min_width(240.0);
+                            ui.set_min_width(250.0);
                             ui.label(
-                                egui::RichText::new("Pedales disponibles")
+                                egui::RichText::new("Añadir pedal a la cadena")
                                     .strong()
                                     .color(Color32::from_rgb(180, 192, 210)),
                             );
                             ui.separator();
 
-                            for (slot_idx, slot) in self.params.slots().iter().enumerate() {
-                                if slot.is_master {
-                                    continue;
-                                }
-                                let mut mounted = slot.is_mounted();
-                                let [r, g, b] = slot.accent_color;
-                                let label = if mounted {
-                                    format!("✓  {}  (En pedalera)", slot.name)
-                                } else {
-                                    format!("➕  {}  (Añadir)", slot.name)
-                                };
-                                let resp = ui.checkbox(
-                                    &mut mounted,
-                                    egui::RichText::new(label).color(Color32::from_rgb(r, g, b)),
-                                );
-                                if resp.changed() {
-                                    if mounted {
-                                        self.params.move_slot_to_end(slot_idx);
+                            for info in &kinds {
+                                let [r, g, b] = info.accent_color;
+                                let can_add =
+                                    info.used < info.max && total_mounted < MAX_MOUNTED_PEDALS;
+                                let btn_text = egui::RichText::new(format!(
+                                    "➕ {}  ({}/{})",
+                                    info.name, info.used, info.max
+                                ))
+                                .color(Color32::from_rgb(r, g, b));
+                                let resp = ui
+                                    .add_enabled(can_add, egui::Button::new(btn_text))
+                                    .on_disabled_hover_text(if info.used >= info.max {
+                                        "Máximo alcanzado"
                                     } else {
-                                        slot.set_mounted(false);
+                                        "Límite máximo de pedales en cadena alcanzado"
+                                    });
+                                if resp.clicked() {
+                                    self.params.mount_new_instance(info.kind);
+                                }
+                            }
+
+                            if !mounted_positions.is_empty() {
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new("En pedalera")
+                                        .strong()
+                                        .color(Color32::from_rgb(180, 192, 210)),
+                                );
+                                for &cascade_pos in &mounted_positions {
+                                    let slot_idx = self.params.order_at(cascade_pos);
+                                    if let Some(slot) = self.params.slots().get(slot_idx) {
+                                        let [r, g, b] = slot.accent_color;
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(slot.display_name())
+                                                    .color(Color32::from_rgb(r, g, b)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .button("✕")
+                                                        .on_hover_text("Quitar de la pedalera")
+                                                        .clicked()
+                                                    {
+                                                        slot.set_mounted(false);
+                                                    }
+                                                },
+                                            );
+                                        });
                                     }
                                 }
                             }
                         },
                     );
 
-                    for (slot_idx, name, [r, g, b]) in &unmounted_slots {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(format!("+ {name}"))
-                                        .strong()
-                                        .color(Color32::from_rgb(*r, *g, *b)),
+                    for info in &kinds {
+                        if info.used == 0 {
+                            let [r, g, b] = info.accent_color;
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("+ {}", info.name))
+                                            .strong()
+                                            .color(Color32::from_rgb(r, g, b)),
+                                    )
+                                    .min_size(Vec2::new(110.0, 28.0)),
                                 )
-                                .min_size(Vec2::new(110.0, 28.0)),
-                            )
-                            .on_hover_text(format!("Añadir {name} al final de la cascada"))
-                            .clicked()
-                        {
-                            self.params.move_slot_to_end(*slot_idx);
+                                .on_hover_text(format!(
+                                    "Añadir {} al final de la cascada",
+                                    info.name
+                                ))
+                                .clicked()
+                            {
+                                self.params.mount_new_instance(info.kind);
+                            }
                         }
                     }
 
@@ -1103,10 +1670,29 @@ impl PedalboardApp {
 impl eframe::App for PedalboardApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.update_meters(ui.ctx());
+        self.draw_preset_bar(ui);
         self.draw_studio_rack(ui);
         self.draw_cascade_board(ui);
+        self.draw_preset_dialogs(ui);
         ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
+}
+
+fn load_preset_from_ref(
+    pref: &PresetRef,
+    user_presets: &[(String, PathBuf)],
+) -> anyhow::Result<Preset> {
+    if pref.source == "factory" {
+        return load_factory_preset(&pref.name);
+    }
+    if let Some((_, path)) = user_presets
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(&pref.name))
+    {
+        let raw = std::fs::read_to_string(path)?;
+        return Preset::from_json(&raw);
+    }
+    resolve_preset(&pref.name)
 }
 
 fn solid_rack_frame(accent: Color32) -> Frame {
@@ -1400,16 +1986,30 @@ fn draw_stompbox_pedal(
 
             ui.add_space(2.0);
             ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new(slot.name.to_uppercase())
-                        .strong()
-                        .size(15.0)
-                        .color(if active {
-                            Color32::from_rgb(241, 245, 249)
-                        } else {
-                            Color32::from_rgb(125, 134, 148)
-                        }),
-                );
+                let title = slot.display_name().to_uppercase();
+                let resp = ui
+                    .add(
+                        egui::Label::new(egui::RichText::new(title).strong().size(15.0).color(
+                            if active {
+                                Color32::from_rgb(241, 245, 249)
+                            } else {
+                                Color32::from_rgb(125, 134, 148)
+                            },
+                        ))
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_text("Clic derecho para renombrar");
+                resp.context_menu(|ui| {
+                    let mut label_buf = slot.label();
+                    ui.label(egui::RichText::new("Etiqueta del pedal").strong());
+                    if ui.text_edit_singleline(&mut label_buf).changed() {
+                        slot.set_label(&label_buf);
+                    }
+                    if ui.button("Restablecer nombre").clicked() {
+                        slot.set_label("");
+                        ui.close();
+                    }
+                });
             });
 
             // Zona compacta de perillas: hasta 3 por fila para evitar alturas innecesarias

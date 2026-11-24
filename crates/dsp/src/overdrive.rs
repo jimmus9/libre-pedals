@@ -2,6 +2,7 @@ use crate::{db_to_lin, sanitize_sample, DcBlocker, Effect, ParamScale, ParamSpec
 
 const OVERDRIVE_PARAMS: [ParamSpec; 3] = [
     ParamSpec {
+        id: "drive_db",
         name: "Drive",
         unit: "dB",
         min: 0.0,
@@ -11,6 +12,7 @@ const OVERDRIVE_PARAMS: [ParamSpec; 3] = [
         decimals: 1,
     },
     ParamSpec {
+        id: "tone_hz",
         name: "Tone",
         unit: "Hz",
         min: 500.0,
@@ -20,6 +22,7 @@ const OVERDRIVE_PARAMS: [ParamSpec; 3] = [
         decimals: 0,
     },
     ParamSpec {
+        id: "level_db",
         name: "Level",
         unit: "dB",
         min: -36.0,
@@ -131,6 +134,10 @@ impl Overdrive {
 }
 
 impl Effect for Overdrive {
+    fn kind(&self) -> &'static str {
+        "overdrive"
+    }
+
     fn name(&self) -> &'static str {
         "Overdrive"
     }

@@ -66,6 +66,7 @@ pub enum ParamScale {
 /// Metadatos autodescriptivos de un parámetro de pedal para construir controles reactivos.
 #[derive(Debug, Clone, Copy)]
 pub struct ParamSpec {
+    pub id: &'static str,
     pub name: &'static str,
     pub unit: &'static str,
     pub min: f32,
@@ -143,6 +144,7 @@ impl ParamSpec {
 ///
 /// Ninguna implementación debe reservar memoria, bloquear mutexes ni hacer E/S en `process`.
 pub trait Effect: Send + AsAny {
+    fn kind(&self) -> &'static str;
     fn name(&self) -> &'static str;
     fn accent_color(&self) -> [u8; 3] {
         [230, 126, 34]
@@ -289,6 +291,10 @@ impl Chain {
 }
 
 impl Effect for Chain {
+    fn kind(&self) -> &'static str {
+        "chain"
+    }
+
     fn name(&self) -> &'static str {
         "Chain"
     }
@@ -538,6 +544,7 @@ mod tests {
     #[test]
     fn metadata_params_and_chain_reorder_work() {
         let lin_spec = ParamSpec {
+            id: "drive_db",
             name: "Drive",
             unit: "dB",
             min: 0.0,
@@ -551,6 +558,7 @@ mod tests {
         assert!((lin_spec.from_normalized(norm) - 20.0).abs() < 1e-5);
 
         let log_spec = ParamSpec {
+            id: "tone_hz",
             name: "Tone",
             unit: "Hz",
             min: 500.0,
