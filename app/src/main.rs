@@ -65,23 +65,23 @@ struct RunArgs {
     latency: Option<u32>,
 
     /// Ganancia del overdrive en dB (0..40)
-    #[arg(long, default_value_t = 12.0)]
+    #[arg(long, default_value_t = 12.0, allow_hyphen_values = true)]
     drive: f32,
 
     /// Frecuencia de tono (pasa-bajos) del overdrive en Hz (500..12000)
-    #[arg(long, default_value_t = 4000.0)]
+    #[arg(long, default_value_t = 4000.0, allow_hyphen_values = true)]
     tone: f32,
 
     /// Nivel de salida del overdrive en dB
-    #[arg(long, default_value_t = -6.0)]
+    #[arg(long, default_value_t = -6.0, allow_hyphen_values = true)]
     level: f32,
 
     /// Umbral del noise gate en dBFS (<= -100 desactiva el gate)
-    #[arg(long, default_value_t = -60.0)]
+    #[arg(long, default_value_t = -60.0, allow_hyphen_values = true)]
     gate: f32,
 
     /// Volumen maestro en dB
-    #[arg(long, default_value_t = -6.0)]
+    #[arg(long, default_value_t = -6.0, allow_hyphen_values = true)]
     volume: f32,
 
     /// Duración máxima de ejecución en segundos (si se omite, corre hasta Ctrl+C)
