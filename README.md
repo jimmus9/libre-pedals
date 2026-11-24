@@ -1,12 +1,74 @@
-# Pedalera Virtual en Rust (Prototipo CLI)
+# libre-pedals — Pedalera virtual en Rust
 
-Motor de efectos de guitarra en tiempo real para Windows escrito en Rust, compatible tanto con **ASIO** (interfaces de audio dedicadas y drivers genéricos como FL Studio ASIO / ASIO4ALL) como con **WASAPI** (entrada de línea/micrófono de 3.5 mm o micrófonos USB).
+![CI](https://github.com/jimmus9/libre-pedals/actions/workflows/ci.yml/badge.svg)
+
+Motor de efectos de guitarra en tiempo real para Windows escrito en Rust, con interfaz gráfica en cascada, analizador espectral PRE/POST en tiempo real y soporte tanto para **ASIO** (interfaces de audio dedicadas y drivers como FL Studio ASIO / ASIO4ALL) como para **WASAPI** (entrada de línea/micrófono de 3.5 mm o micrófonos USB).
 
 ## Estructura del workspace
 
-- `crates/dsp`: Procesamiento de audio puro sin dependencias de hardware (`NoiseGate`, `Overdrive`, `Gain`, `DcBlocker`, `Chain`).
-- `crates/engine`: Motor de entrada/salida con `cpal`, ring buffer lock-free (`rtrb`), control de deriva de reloj para WASAPI, parámetros atómicos y medidores.
-- `app` (paquete `pedalera`): Aplicación de línea de comandos para listar dispositivos y ejecutar la cadena de efectos.
+- `crates/dsp`: Procesamiento de audio puro sin dependencias de hardware (`NoiseGate`, `Overdrive`, `Gain`, `DcBlocker`, `Chain`, `Resampler` cúbico y analizador FFT).
+- `crates/engine`: Motor de entrada/salida con `cpal`, ring buffer lock-free (`rtrb`), control de deriva de reloj para WASAPI, parámetros atómicos con soporte para múltiples instancias por pedal, medidores y formato JSON de presets (`Preset`).
+- `app` (paquete `pedalera`): Aplicación gráfica (`eframe`/`egui`), gestión de presets de usuario/fábrica, persistencia en `settings.json` y subcomandos CLI (`gui`, `list`, `presets`, `run`).
+
+## Descargas y CI
+
+En cada `push` a `main` y en cada *Pull Request*, GitHub Actions ejecuta `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --workspace` y genera dos artefactos descargables para Windows (`libre-pedals-wasapi-windows-x64.zip` y `libre-pedals-asio-windows-x64.zip`) en la pestaña **Actions**.
+
+Al crear una etiqueta con prefijo `v*` (por ejemplo `v0.2.0`), el workflow publica automáticamente una **Release** en GitHub con ambos binarios adjuntos.
+
+## Presets y configuración
+
+Los presets guardan el sonido de la cadena de efectos de forma portable entre equipos:
+
+- **Master Volume fuera del preset:** El volumen maestro global permanece intacto al cambiar de preset para evitar saltos bruscos de volumen. Cada preset tiene su propio ajuste `preset_level_db` con rampa suave.
+- **Múltiples copias por tipo:** Puedes montar hasta **4 instancias** del mismo tipo de pedal en la misma cadena (máximo 12 pedales en total), reordenarlos libremente y dar clic derecho en el título de un pedal para renombrarlo (por ejemplo, `"Boost"` y `"Drive"`).
+- **Presets de fábrica incluidos:** `Clean`, `Crunch` y `Lead (Boost + Drive)`.
+- **Ubicación de presets de usuario:** `%APPDATA%\libre-pedals\presets\*.json`.
+- **Configuración local separada:** Host, dispositivos de entrada/salida, canal, tamaño de buffer, resolución DSP, Master Volume y último preset se guardan aparte en `%APPDATA%\libre-pedals\settings.json`.
+
+Ejemplo de preset JSON (`format_version: 1`):
+
+```json
+{
+  "format_version": 1,
+  "name": "Lead (Boost + Drive)",
+  "author": "libre-pedals",
+  "description": "Doble overdrive en cascada: Boost empujando a Drive",
+  "chain": [
+    {
+      "id": "noise_gate-1",
+      "pedal": "noise_gate",
+      "enabled": true,
+      "params": {
+        "threshold_db": -55.0
+      }
+    },
+    {
+      "id": "overdrive-1",
+      "pedal": "overdrive",
+      "label": "Boost",
+      "enabled": true,
+      "params": {
+        "drive_db": 4.0,
+        "tone_hz": 7000.0,
+        "level_db": 6.0
+      }
+    },
+    {
+      "id": "overdrive-2",
+      "pedal": "overdrive",
+      "label": "Drive",
+      "enabled": true,
+      "params": {
+        "drive_db": 26.0,
+        "tone_hz": 4200.0,
+        "level_db": -14.0
+      }
+    }
+  ],
+  "preset_level_db": -2.0
+}
+```
 
 ## Requisitos de compilación en Windows
 
@@ -40,15 +102,17 @@ $env:CPAL_ASIO_DIR = "<ruta>\ASIOSDK"
 cargo build --release --features asio
 ```
 
-Ejecutar pruebas unitarias de DSP:
+Ejecutar pruebas unitarias y linter:
 
 ```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
 ## Ejemplos de uso
 
-Abrir la interfaz gráfica (cascada de pedales con perillas en vivo):
+Abrir la interfaz gráfica (barra de presets, rack I/O, cascada de pedales y analizador espectral PRE/POST):
 
 ```powershell
 .\target\release\pedalera.exe
@@ -60,6 +124,18 @@ Listar todos los dispositivos y drivers detectados:
 
 ```powershell
 .\target\release\pedalera.exe list
+```
+
+Listar presets de fábrica y de usuario disponibles:
+
+```powershell
+.\target\release\pedalera.exe presets
+```
+
+Ejecutar por consola cargando un preset de fábrica, usuario o archivo JSON:
+
+```powershell
+.\target\release\pedalera.exe run --host wasapi --preset "Lead (Boost + Drive)" --mute
 ```
 
 Probar con micrófono USB o entrada de línea en WASAPI (con `--mute` para evitar acoples):
@@ -82,6 +158,7 @@ Tocar usando ASIO (mismo driver para entrada y salida):
 
 ### Parámetros útiles de `run`
 
+- `--preset <NOMBRE|RUTA>`: Carga un preset de fábrica, de usuario o archivo `.json` al arrancar.
 - `--in-channel <N>`: Canal de entrada base 0 (ej. `0` para entrada 1, `1` para entrada 2 de una interfaz estéreo).
 - `--buffer <FRAMES>`: Tamaño de buffer solicitado (ej. `128`, `256`). Si el driver lo rechaza (habitual en WASAPI compartido), pasa automáticamente a `Default`.
 - `--latency <FRAMES>`: Tamaño de prellenado del ring buffer (por defecto `2 * buffer` o `512`).
@@ -108,3 +185,9 @@ Y para comprobar cuáles responden realmente con sus canales y frecuencias de mu
 ```powershell
 .\target\release\pedalera.exe list
 ```
+
+## Licencia
+
+Este proyecto se distribuye bajo la licencia **GNU General Public License v3.0 o posterior (`GPL-3.0-or-later`)** — consulta [LICENSE](LICENSE).
+
+El ASIO SDK de Steinberg cuenta con licencia dual (incluyendo **GPLv3**) desde octubre de 2025, por lo que los binarios compilados con soporte ASIO (`--features asio`) se distribuyen íntegramente bajo GPLv3.
