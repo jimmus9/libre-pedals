@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
-use dsp::{compute_spectrum_db, compute_waveform_metrics, find_rising_zero_crossing};
+use dsp::{
+    compute_spectrum_db, compute_waveform_metrics, find_rising_zero_crossing, WaveformMetrics,
+};
 use eframe::egui::{
     self, Align2, Color32, ColorImage, CornerRadius, FontId, Frame, Margin, Pos2, Rect, Sense,
     Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2,
@@ -265,7 +267,7 @@ impl AnalyzerState {
                             );
                         }
 
-                        ui.label("Trazos:");
+                        ui.label("Trazos FFT:");
                         for (mode, lbl) in [
                             (TraceView::Both, "PRE + POST"),
                             (TraceView::PreOnly, "Solo PRE"),
@@ -287,193 +289,121 @@ impl AnalyzerState {
 
                 ui.add_space(8.0);
 
-                if ui.available_width() >= 920.0 {
-                    ui.columns(2, |cols| {
-                        self.draw_oscilloscope(&mut cols[0]);
-                        self.draw_spectrum_and_waterfall(&mut cols[1]);
+                let scope = compute_scope_window(
+                    &self.pre_scratch,
+                    &self.post_scratch,
+                    self.time_window_ms,
+                    self.last_sr,
+                    self.relative_ref,
+                    self.abs_zoom,
+                );
+
+                let waterfall_source = &mut self.waterfall_source;
+                let smooth_pre_spec = &self.smooth_pre_spec;
+                let smooth_post_spec = &self.smooth_post_spec;
+                let waterfall_tex = &self.waterfall_tex;
+                let relative_ref = self.relative_ref;
+                let view_mode = self.view_mode;
+                let last_sr = self.last_sr;
+
+                if ui.available_width() >= 960.0 {
+                    ui.columns(3, |cols| {
+                        draw_single_oscilloscope(&mut cols[0], true, &scope);
+                        draw_spectrum_and_waterfall(
+                            &mut cols[1],
+                            waterfall_source,
+                            smooth_pre_spec,
+                            smooth_post_spec,
+                            waterfall_tex,
+                            relative_ref,
+                            view_mode,
+                            last_sr,
+                        );
+                        draw_single_oscilloscope(&mut cols[2], false, &scope);
                     });
                 } else {
-                    self.draw_oscilloscope(ui);
+                    draw_single_oscilloscope(ui, true, &scope);
                     ui.add_space(10.0);
-                    self.draw_spectrum_and_waterfall(ui);
+                    draw_spectrum_and_waterfall(
+                        ui,
+                        waterfall_source,
+                        smooth_pre_spec,
+                        smooth_post_spec,
+                        waterfall_tex,
+                        relative_ref,
+                        view_mode,
+                        last_sr,
+                    );
+                    ui.add_space(10.0);
+                    draw_single_oscilloscope(ui, false, &scope);
                 }
             });
     }
+}
 
-    fn draw_oscilloscope(&self, ui: &mut egui::Ui) {
-        let win_samples = ((self.time_window_ms / 1_000.0) * self.last_sr as f32)
-            .round()
-            .clamp(64.0, (ANALYZER_BUF_LEN / 2) as f32) as usize;
-        let search_len = (win_samples * 2).min(ANALYZER_BUF_LEN - win_samples);
-        let tail_len = (win_samples + search_len).min(self.pre_scratch.len());
-        let tail_start = self.pre_scratch.len().saturating_sub(tail_len);
+fn compute_scope_window<'a>(
+    pre_scratch: &'a [f32],
+    post_scratch: &'a [f32],
+    time_window_ms: f32,
+    last_sr: u32,
+    relative_ref: bool,
+    abs_zoom: f32,
+) -> ScopeWindow<'a> {
+    let win_samples = ((time_window_ms / 1_000.0) * last_sr as f32)
+        .round()
+        .clamp(64.0, (ANALYZER_BUF_LEN / 2) as f32) as usize;
+    let search_len = (win_samples * 2).min(ANALYZER_BUF_LEN - win_samples);
+    let tail_len = (win_samples + search_len).min(pre_scratch.len());
+    let tail_start = pre_scratch.len().saturating_sub(tail_len);
 
-        let pre_tail = &self.pre_scratch[tail_start..];
-        let post_tail = &self.post_scratch[tail_start..];
+    let pre_tail = &pre_scratch[tail_start..];
+    let post_tail = &post_scratch[tail_start..];
 
-        let pre_metrics = compute_waveform_metrics(&pre_tail[pre_tail.len().saturating_sub(win_samples)..]);
-        let post_metrics = compute_waveform_metrics(&post_tail[post_tail.len().saturating_sub(win_samples)..]);
+    let pre_metrics =
+        compute_waveform_metrics(&pre_tail[pre_tail.len().saturating_sub(win_samples)..]);
+    let post_metrics =
+        compute_waveform_metrics(&post_tail[post_tail.len().saturating_sub(win_samples)..]);
 
-        let trigger_offset = match self.view_mode {
-            TraceView::PreOnly => find_rising_zero_crossing(pre_tail, search_len),
-            TraceView::PostOnly => find_rising_zero_crossing(post_tail, search_len),
-            TraceView::Both => {
-                if pre_metrics.peak > 0.002 {
-                    find_rising_zero_crossing(pre_tail, search_len)
-                } else {
-                    find_rising_zero_crossing(post_tail, search_len)
-                }
-            }
-        };
+    let trigger_offset = if pre_metrics.peak > 0.002 {
+        find_rising_zero_crossing(pre_tail, search_len)
+    } else {
+        find_rising_zero_crossing(post_tail, search_len)
+    };
 
-        let end = (trigger_offset + win_samples).min(pre_tail.len());
-        let pre_slice = &pre_tail[trigger_offset..end];
-        let post_slice = &post_tail[trigger_offset..end];
+    let end = (trigger_offset + win_samples).min(pre_tail.len());
+    let pre_slice = &pre_tail[trigger_offset..end];
+    let post_slice = &post_tail[trigger_offset..end];
 
-        let (scale_pre, scale_post) = if self.relative_ref {
-            (
-                0.88 / pre_metrics.peak.max(0.002),
-                0.88 / post_metrics.peak.max(0.002),
-            )
-        } else {
-            (self.abs_zoom, self.abs_zoom)
-        };
+    let (scale_pre, scale_post) = if relative_ref {
+        (
+            0.88 / pre_metrics.peak.max(0.002),
+            0.88 / post_metrics.peak.max(0.002),
+        )
+    } else {
+        (abs_zoom, abs_zoom)
+    };
 
-        Frame::new()
-            .fill(Color32::from_rgb(11, 14, 19))
-            .corner_radius(CornerRadius::same(8))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(38, 45, 58)))
-            .inner_margin(Margin::same(10))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new("〰 OSCILOSCOPIO DE ONDA")
-                            .strong()
-                            .size(12.5)
-                            .color(Color32::from_rgb(203, 213, 225)),
-                    );
-                    ui.label(
-                        egui::RichText::new("■ PRE (Limpio)")
-                            .size(11.5)
-                            .color(Color32::from_rgb(56, 189, 248)),
-                    );
-                    ui.label(
-                        egui::RichText::new("■ POST (Efectos)")
-                            .size(11.5)
-                            .color(Color32::from_rgb(251, 146, 60)),
-                    );
-                });
-
-                // Métricas matemáticas (Cresta ~3.01 dB = senoidal, <1.8 dB = cuadrada/recortada)
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "PRE: {:.1} dBFS · Cresta {:.2} dB (x{:.1})",
-                            pre_metrics.peak_db, pre_metrics.crest_factor_db, scale_pre
-                        ))
-                        .monospace()
-                        .size(11.0)
-                        .color(Color32::from_rgb(125, 211, 252)),
-                    );
-                    ui.separator();
-                    let delta_db = post_metrics.peak_db - pre_metrics.peak_db;
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "POST: {:.1} dBFS · Cresta {:.2} dB (x{:.1}) · Δ {:+.1} dB",
-                            post_metrics.peak_db,
-                            post_metrics.crest_factor_db,
-                            scale_post,
-                            delta_db
-                        ))
-                        .monospace()
-                        .size(11.0)
-                        .color(Color32::from_rgb(253, 186, 116)),
-                    );
-                });
-
-                ui.add_space(4.0);
-
-                let plot_w = ui.available_width().max(240.0);
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(plot_w, 232.0), Sense::hover());
-                let p = ui.painter();
-
-                p.rect(
-                    rect,
-                    CornerRadius::same(6),
-                    Color32::from_rgb(8, 10, 14),
-                    Stroke::new(1.0, Color32::from_rgb(35, 42, 54)),
-                    StrokeKind::Inside,
-                );
-
-                // Rejilla de amplitud y tiempo
-                for div in 1..4 {
-                    let y = rect.min.y + rect.height() * (div as f32 / 4.0);
-                    let stroke = if div == 2 {
-                        Stroke::new(1.0, Color32::from_rgb(56, 65, 82))
-                    } else {
-                        Stroke::new(0.8, Color32::from_rgb(26, 31, 40))
-                    };
-                    p.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], stroke);
-                }
-                for div in 1..5 {
-                    let x = rect.min.x + rect.width() * (div as f32 / 5.0);
-                    p.line_segment(
-                        [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
-                        Stroke::new(0.8, Color32::from_rgb(26, 31, 40)),
-                    );
-                }
-
-                let paint_trace = |slice: &[f32], scale: f32, color: Color32, width: f32| {
-                    if slice.len() < 2 {
-                        return;
-                    }
-                    let max_pts = (rect.width() as usize).clamp(64, 512);
-                    let step = (slice.len() as f32 / max_pts as f32).max(1.0);
-                    let mut pts = Vec::with_capacity(max_pts + 1);
-                    let cy = rect.center().y;
-                    let half_h = rect.height() * 0.46;
-
-                    let mut idx_f = 0.0_f32;
-                    while (idx_f as usize) < slice.len() {
-                        let i = idx_f as usize;
-                        let t = i as f32 / (slice.len() - 1) as f32;
-                        let x = rect.min.x + t * rect.width();
-                        let y_norm = (slice[i] * scale).clamp(-1.05, 1.05);
-                        let y = cy - y_norm * half_h;
-                        pts.push(Pos2::new(x, y));
-                        idx_f += step;
-                    }
-                    p.line(pts, Stroke::new(width, color));
-                };
-
-                if matches!(self.view_mode, TraceView::Both | TraceView::PreOnly) {
-                    paint_trace(
-                        pre_slice,
-                        scale_pre,
-                        Color32::from_rgb(56, 189, 248),
-                        1.8,
-                    );
-                }
-                if matches!(self.view_mode, TraceView::Both | TraceView::PostOnly) {
-                    paint_trace(
-                        post_slice,
-                        scale_post,
-                        Color32::from_rgb(251, 146, 60),
-                        2.0,
-                    );
-                }
-
-                p.text(
-                    Pos2::new(rect.max.x - 6.0, rect.max.y - 6.0),
-                    Align2::RIGHT_BOTTOM,
-                    "Senoidal ≈ 3.0 dB cresta · Cuadrada ≈ 0.0 dB",
-                    FontId::proportional(10.5),
-                    Color32::from_rgb(100, 114, 134),
-                );
-            });
+    ScopeWindow {
+        pre_slice,
+        post_slice,
+        pre_metrics,
+        post_metrics,
+        scale_pre,
+        scale_post,
     }
+}
 
-    fn draw_spectrum_and_waterfall(&mut self, ui: &mut egui::Ui) {
+#[allow(clippy::too_many_arguments)]
+fn draw_spectrum_and_waterfall(
+    ui: &mut egui::Ui,
+    waterfall_source: &mut WaterfallSource,
+    smooth_pre_spec: &[f32],
+    smooth_post_spec: &[f32],
+    waterfall_tex: &Option<TextureHandle>,
+    relative_ref: bool,
+    view_mode: TraceView,
+    last_sr: u32,
+) {
         Frame::new()
             .fill(Color32::from_rgb(11, 14, 19))
             .corner_radius(CornerRadius::same(8))
@@ -489,12 +419,12 @@ impl AnalyzerState {
                     );
                     ui.label("Cascada:");
                     ui.selectable_value(
-                        &mut self.waterfall_source,
+                        waterfall_source,
                         WaterfallSource::Post,
                         "POST",
                     );
                     ui.selectable_value(
-                        &mut self.waterfall_source,
+                        waterfall_source,
                         WaterfallSource::Pre,
                         "PRE",
                     );
@@ -503,9 +433,9 @@ impl AnalyzerState {
                 ui.add_space(4.0);
 
                 // Parte superior: Espectro FFT PRE vs POST (log 40 Hz .. 16 kHz)
-                let plot_w = ui.available_width().max(240.0);
+                let plot_w = ui.available_width().max(180.0);
                 let (spec_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(plot_w, 134.0), Sense::hover());
+                    ui.allocate_exact_size(Vec2::new(plot_w, 128.0), Sense::hover());
                 let p = ui.painter();
 
                 p.rect(
@@ -561,7 +491,7 @@ impl AnalyzerState {
                         [Pos2::new(spec_rect.min.x, y), Pos2::new(spec_rect.max.x, y)],
                         Stroke::new(0.8, Color32::from_rgb(28, 34, 44)),
                     );
-                    let tag = if self.relative_ref {
+                    let tag = if relative_ref {
                         format!("{db_line:.0} dBr")
                     } else {
                         format!("{db_line:.0} dB")
@@ -575,14 +505,14 @@ impl AnalyzerState {
                     );
                 }
 
-                let pre_ref = if self.relative_ref {
-                    let pk = peak_in_band(&self.smooth_pre_spec, self.last_sr);
+                let pre_ref = if relative_ref {
+                    let pk = peak_in_band(smooth_pre_spec, last_sr);
                     if pk > -75.0 { pk } else { 0.0 }
                 } else {
                     0.0
                 };
-                let post_ref = if self.relative_ref {
-                    let pk = peak_in_band(&self.smooth_post_spec, self.last_sr);
+                let post_ref = if relative_ref {
+                    let pk = peak_in_band(smooth_post_spec, last_sr);
                     if pk > -75.0 { pk } else { 0.0 }
                 } else {
                     0.0
@@ -590,7 +520,7 @@ impl AnalyzerState {
 
                 let paint_spec = |spec: &[f32], ref_db: f32, color: Color32, width: f32| {
                     let cols = (spec_rect.width() as usize).clamp(64, 320);
-                    let bin_hz = self.last_sr as f32 / FFT_LEN as f32;
+                    let bin_hz = last_sr as f32 / FFT_LEN as f32;
                     let mut pts = Vec::with_capacity(cols);
                     for i in 0..cols {
                         let u = i as f32 / (cols - 1) as f32;
@@ -605,17 +535,17 @@ impl AnalyzerState {
                     p.line(pts, Stroke::new(width, color));
                 };
 
-                if matches!(self.view_mode, TraceView::Both | TraceView::PreOnly) {
+                if matches!(view_mode, TraceView::Both | TraceView::PreOnly) {
                     paint_spec(
-                        &self.smooth_pre_spec,
+                        smooth_pre_spec,
                         pre_ref,
                         Color32::from_rgb(56, 189, 248),
                         1.7,
                     );
                 }
-                if matches!(self.view_mode, TraceView::Both | TraceView::PostOnly) {
+                if matches!(view_mode, TraceView::Both | TraceView::PostOnly) {
                     paint_spec(
-                        &self.smooth_post_spec,
+                        smooth_post_spec,
                         post_ref,
                         Color32::from_rgb(251, 146, 60),
                         2.0,
@@ -628,7 +558,7 @@ impl AnalyzerState {
                 let (wf_rect, _) =
                     ui.allocate_exact_size(Vec2::new(plot_w, 102.0), Sense::hover());
                 let p = ui.painter();
-                if let Some(tex) = &self.waterfall_tex {
+                if let Some(tex) = waterfall_tex {
                     p.image(
                         tex.id(),
                         wf_rect,
@@ -649,7 +579,7 @@ impl AnalyzerState {
                     Align2::LEFT_TOP,
                     format!(
                         "Espectrograma {} (40 Hz → 16 kHz · Tiempo ↓)",
-                        match self.waterfall_source {
+                        match *waterfall_source {
                             WaterfallSource::Post => "POST",
                             WaterfallSource::Pre => "PRE",
                         }
@@ -658,7 +588,130 @@ impl AnalyzerState {
                     Color32::from_rgba_unmultiplied(230, 236, 245, 200),
                 );
             });
-    }
+}
+
+struct ScopeWindow<'a> {
+    pre_slice: &'a [f32],
+    post_slice: &'a [f32],
+    pre_metrics: WaveformMetrics,
+    post_metrics: WaveformMetrics,
+    scale_pre: f32,
+    scale_post: f32,
+}
+
+fn draw_single_oscilloscope(ui: &mut egui::Ui, is_pre: bool, scope: &ScopeWindow<'_>) {
+    let (title, accent, slice, metrics, scale, extra_delta) = if is_pre {
+        (
+            "〰 ONDA PRE (LIMPIA)",
+            Color32::from_rgb(56, 189, 248),
+            scope.pre_slice,
+            scope.pre_metrics,
+            scope.scale_pre,
+            None,
+        )
+    } else {
+        (
+            "〰 ONDA POST (CON EFECTOS)",
+            Color32::from_rgb(251, 146, 60),
+            scope.post_slice,
+            scope.post_metrics,
+            scope.scale_post,
+            Some(scope.post_metrics.peak_db - scope.pre_metrics.peak_db),
+        )
+    };
+
+    Frame::new()
+        .fill(Color32::from_rgb(11, 14, 19))
+        .corner_radius(CornerRadius::same(8))
+        .stroke(Stroke::new(
+            1.0,
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 100),
+        ))
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(title)
+                    .strong()
+                    .size(12.5)
+                    .color(accent),
+            );
+
+            let metric_text = match extra_delta {
+                None => format!(
+                    "Pico: {:.1} dBFS · Cresta: {:.2} dB (x{:.1})",
+                    metrics.peak_db, metrics.crest_factor_db, scale
+                ),
+                Some(delta) => format!(
+                    "Pico: {:.1} dBFS · Cresta: {:.2} dB (x{:.1}) · Δ {:+.1} dB",
+                    metrics.peak_db, metrics.crest_factor_db, scale, delta
+                ),
+            };
+            ui.label(
+                egui::RichText::new(metric_text)
+                    .monospace()
+                    .size(11.0)
+                    .color(Color32::from_rgb(203, 213, 225)),
+            );
+
+            ui.add_space(4.0);
+
+            let plot_w = ui.available_width().max(180.0);
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(plot_w, 224.0), Sense::hover());
+            let p = ui.painter();
+
+            p.rect(
+                rect,
+                CornerRadius::same(6),
+                Color32::from_rgb(8, 10, 14),
+                Stroke::new(1.0, Color32::from_rgb(35, 42, 54)),
+                StrokeKind::Inside,
+            );
+
+            for div in 1..4 {
+                let y = rect.min.y + rect.height() * (div as f32 / 4.0);
+                let stroke = if div == 2 {
+                    Stroke::new(1.0, Color32::from_rgb(56, 65, 82))
+                } else {
+                    Stroke::new(0.8, Color32::from_rgb(26, 31, 40))
+                };
+                p.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], stroke);
+            }
+            for div in 1..5 {
+                let x = rect.min.x + rect.width() * (div as f32 / 5.0);
+                p.line_segment(
+                    [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
+                    Stroke::new(0.8, Color32::from_rgb(26, 31, 40)),
+                );
+            }
+
+            if slice.len() >= 2 {
+                let max_pts = (rect.width() as usize).clamp(64, 512);
+                let step = (slice.len() as f32 / max_pts as f32).max(1.0);
+                let mut pts = Vec::with_capacity(max_pts + 1);
+                let cy = rect.center().y;
+                let half_h = rect.height() * 0.45;
+
+                let mut idx_f = 0.0_f32;
+                while (idx_f as usize) < slice.len() {
+                    let i = idx_f as usize;
+                    let t = i as f32 / (slice.len() - 1) as f32;
+                    let x = rect.min.x + t * rect.width();
+                    let y_norm = (slice[i] * scale).clamp(-1.05, 1.05);
+                    let y = cy - y_norm * half_h;
+                    pts.push(Pos2::new(x, y));
+                    idx_f += step;
+                }
+                p.line(pts, Stroke::new(2.0, accent));
+            }
+
+            p.text(
+                Pos2::new(rect.max.x - 6.0, rect.max.y - 6.0),
+                Align2::RIGHT_BOTTOM,
+                "Senoidal ≈ 3.0 dB · Cuadrada ≈ 0.0 dB",
+                FontId::proportional(10.0),
+                Color32::from_rgb(100, 114, 134),
+            );
+        });
 }
 
 fn copy_deque_to_slice(dq: &VecDeque<f32>, dst: &mut [f32]) {
