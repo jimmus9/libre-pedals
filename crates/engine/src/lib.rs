@@ -13,13 +13,13 @@ use cpal::{
     BufferSize, Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
     SupportedBufferSize, SupportedStreamConfig,
 };
-use dsp::{db_to_lin, Chain, Effect, Gain, NoiseGate, Overdrive, Resampler};
+use dsp::{db_to_lin, Chain, Effect, Gain, NoiseGate, Overdrive, Resampler, ScopedNoDenormals};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 pub use devices::{list_devices, ConfigSummary, DeviceReport, HostKind, HostReport};
 pub use params::{
-    InitialParams, KindInfo, MeterSnapshot, Meters, Params, PedalParamSlot, MAX_INSTANCES_PER_KIND,
-    MAX_MOUNTED_PEDALS, PRESET_LEVEL_MAX_DB, PRESET_LEVEL_MIN_DB,
+    InitialParams, KindInfo, MeterSnapshot, Meters, Params, PedalParamSlot, TestSignalMode,
+    MAX_INSTANCES_PER_KIND, MAX_MOUNTED_PEDALS, PRESET_LEVEL_MAX_DB, PRESET_LEVEL_MIN_DB,
 };
 pub use preset::{Preset, PresetPedal, PRESET_FORMAT_VERSION};
 
@@ -718,6 +718,37 @@ fn build_output_for_format(
     }
 }
 
+#[inline]
+fn next_test_sample(
+    mode: TestSignalMode,
+    freq_hz: f32,
+    level_lin: f32,
+    proc_sr: f64,
+    phase1: &mut f64,
+    phase2: &mut f64,
+) -> f32 {
+    let two_pi = std::f64::consts::TAU;
+    match mode {
+        TestSignalMode::Off => 0.0,
+        TestSignalMode::Sine | TestSignalMode::AliasingSine => {
+            let f = if matches!(mode, TestSignalMode::AliasingSine) {
+                4_370.0
+            } else {
+                freq_hz as f64
+            };
+            let s = ((*phase1).sin() as f32) * level_lin;
+            *phase1 = (*phase1 + two_pi * f / proc_sr) % two_pi;
+            s
+        }
+        TestSignalMode::TwoToneImd => {
+            let s = 0.5 * (((*phase1).sin() + (*phase2).sin()) as f32) * level_lin;
+            *phase1 = (*phase1 + two_pi * 220.0 / proc_sr) % two_pi;
+            *phase2 = (*phase2 + two_pi * 330.0 / proc_sr) % two_pi;
+            s
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_output_typed<T>(
     dev: &Device,
@@ -743,11 +774,15 @@ where
     let mut fifo_buf = vec![0.0_f32; 16_384];
     let mut fifo_len = 0usize;
     let mut level_gain = db_to_lin(params.preset_level_db());
+    let mut test_phase1 = 0.0_f64;
+    let mut test_phase2 = 0.0_f64;
+    let proc_sr_f64 = (proc_sample_rate as f64).max(1.0);
     let meters_err = Arc::clone(&meters);
 
     let stream = dev.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            let _no_denormals = ScopedNoDenormals::new();
             let frames_needed = data.len() / out_channels;
             if frames_needed == 0 {
                 return;
@@ -755,6 +790,9 @@ where
 
             sync_chain_from_params(&mut chain, &params);
             let muted = params.mute();
+            let test_mode = params.test_signal_mode();
+            let test_freq = params.test_freq_hz();
+            let test_level = db_to_lin(params.test_level_db());
 
             if drift_control {
                 let min_keep_proc =
@@ -786,12 +824,24 @@ where
                     let pre_block = &mut pre_scratch[..chunk_frames];
 
                     for (slot, pre_slot) in block.iter_mut().zip(pre_block.iter_mut()) {
-                        let s = match consumer.pop() {
+                        let input_s = match consumer.pop() {
                             Ok(v) => v,
                             Err(_) => {
                                 had_underrun = true;
                                 0.0
                             }
+                        };
+                        let s = if test_mode == TestSignalMode::Off {
+                            input_s
+                        } else {
+                            next_test_sample(
+                                test_mode,
+                                test_freq,
+                                test_level,
+                                proc_sr_f64,
+                                &mut test_phase1,
+                                &mut test_phase2,
+                            )
                         };
                         *slot = s;
                         *pre_slot = s;
@@ -825,12 +875,24 @@ where
                     let pre_block = &mut pre_scratch[..MICRO_BLOCK_FRAMES];
 
                     for (slot, pre_slot) in block.iter_mut().zip(pre_block.iter_mut()) {
-                        let s = match consumer.pop() {
+                        let input_s = match consumer.pop() {
                             Ok(v) => v,
                             Err(_) => {
                                 had_underrun = true;
                                 0.0
                             }
+                        };
+                        let s = if test_mode == TestSignalMode::Off {
+                            input_s
+                        } else {
+                            next_test_sample(
+                                test_mode,
+                                test_freq,
+                                test_level,
+                                proc_sr_f64,
+                                &mut test_phase1,
+                                &mut test_phase2,
+                            )
                         };
                         *slot = s;
                         *pre_slot = s;

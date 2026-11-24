@@ -1,19 +1,33 @@
 use std::any::Any;
 
+pub mod adaa;
 pub mod analyzer;
+pub mod denormals;
 pub mod gain;
 pub mod gate;
+pub mod matched_eq;
 pub mod overdrive;
+pub mod oversampler;
 pub mod resampler;
+pub mod smoother;
+pub mod svf;
 
+pub use adaa::{AsymSoftClipAdaa1, HalfSampleDelay, TanhAdaa1};
 pub use analyzer::{
-    compute_spectrum_db, compute_waveform_metrics, fft_in_place, find_rising_zero_crossing,
-    WaveformMetrics,
+    compute_esr_db, compute_harmonic_metrics, compute_imd_db, compute_spectrum_db,
+    compute_spectrum_db_with_window, compute_waveform_metrics, fft_in_place,
+    find_rising_zero_crossing, generate_coherent_sine, HarmonicMetrics, WaveformMetrics,
+    WindowKind,
 };
+pub use denormals::{flush_denormal, flush_denormal_f64, ScopedNoDenormals};
 pub use gain::Gain;
 pub use gate::NoiseGate;
+pub use matched_eq::{MatchedBiquad, MatchedFilterKind};
 pub use overdrive::Overdrive;
+pub use oversampler::{adaptive_oversampling_factor, HalfBandStage2x, Oversampler};
 pub use resampler::Resampler;
+pub use smoother::{ModeCrossfader, OnePoleSmoother};
+pub use svf::{SvfMode, SvfTpt};
 
 /// Conversión de decibelios a ganancia lineal. Valores <= -120 dB se tratan como silencio.
 #[inline]
@@ -61,6 +75,7 @@ impl<T: Any> AsAny for T {
 pub enum ParamScale {
     Linear,
     Logarithmic,
+    Stepped { labels: &'static [&'static str] },
 }
 
 /// Metadatos autodescriptivos de un parámetro de pedal para construir controles reactivos.
@@ -77,12 +92,34 @@ pub struct ParamSpec {
 }
 
 impl ParamSpec {
+    /// Índice discreto acotado para parámetros [`ParamScale::Stepped`] (o entero redondeado).
+    #[inline]
+    pub fn step_index(&self, val: f32) -> usize {
+        let v = self.clamp(val);
+        match self.scale {
+            ParamScale::Stepped { labels } => {
+                if labels.is_empty() {
+                    0
+                } else {
+                    (v.round() as isize).clamp(0, (labels.len() - 1) as isize) as usize
+                }
+            }
+            ParamScale::Linear | ParamScale::Logarithmic => v.round().max(0.0) as usize,
+        }
+    }
+
     #[inline]
     pub fn clamp(&self, val: f32) -> f32 {
-        if val.is_finite() {
-            val.clamp(self.min, self.max)
-        } else {
-            self.default
+        let v = if val.is_finite() { val } else { self.default };
+        match self.scale {
+            ParamScale::Stepped { labels } => {
+                if labels.is_empty() {
+                    0.0
+                } else {
+                    v.round().clamp(0.0, (labels.len() - 1) as f32)
+                }
+            }
+            ParamScale::Linear | ParamScale::Logarithmic => v.clamp(self.min, self.max),
         }
     }
 
@@ -90,13 +127,26 @@ impl ParamSpec {
     #[inline]
     pub fn to_normalized(&self, val: f32) -> f32 {
         let v = self.clamp(val);
-        if self.max <= self.min {
-            return 0.0;
-        }
         match self.scale {
-            ParamScale::Linear => ((v - self.min) / (self.max - self.min)).clamp(0.0, 1.0),
+            ParamScale::Stepped { labels } => {
+                let last = labels.len().saturating_sub(1);
+                if last == 0 {
+                    0.0
+                } else {
+                    (v.round() / last as f32).clamp(0.0, 1.0)
+                }
+            }
+            ParamScale::Linear => {
+                if self.max <= self.min {
+                    0.0
+                } else {
+                    ((v - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
+                }
+            }
             ParamScale::Logarithmic => {
-                if self.min > 0.0 && self.max > self.min {
+                if self.max <= self.min {
+                    0.0
+                } else if self.min > 0.0 {
                     ((v / self.min).ln() / (self.max / self.min).ln()).clamp(0.0, 1.0)
                 } else {
                     ((v - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
@@ -114,6 +164,10 @@ impl ParamSpec {
             0.0
         };
         let raw = match self.scale {
+            ParamScale::Stepped { labels } => {
+                let last = labels.len().saturating_sub(1);
+                (n * last as f32).round()
+            }
             ParamScale::Linear => self.min + n * (self.max - self.min),
             ParamScale::Logarithmic => {
                 if self.min > 0.0 && self.max > self.min {
@@ -128,6 +182,13 @@ impl ParamSpec {
 
     pub fn format_value(&self, val: f32) -> String {
         let v = self.clamp(val);
+        if let ParamScale::Stepped { labels } = self.scale {
+            if labels.is_empty() {
+                return String::new();
+            }
+            let idx = self.step_index(v);
+            return labels[idx].to_string();
+        }
         if self.unit == "dB" && self.min <= -100.0 && v <= -100.0 {
             return "OFF".to_string();
         }
@@ -653,5 +714,257 @@ mod tests {
 
         let zc = find_rising_zero_crossing(&samples[10..], 200);
         assert!(zc > 0 && zc < 60);
+    }
+
+    #[test]
+    fn hiir_halfband_passband_stopband_and_aliasing_reduction() {
+        assert_eq!(adaptive_oversampling_factor(32_000.0), 8);
+        assert_eq!(adaptive_oversampling_factor(44_100.0), 4);
+        assert_eq!(adaptive_oversampling_factor(48_000.0), 4);
+        assert_eq!(adaptive_oversampling_factor(96_000.0), 2);
+        assert_eq!(adaptive_oversampling_factor(128_000.0), 2);
+        assert_eq!(adaptive_oversampling_factor(192_000.0), 1);
+
+        let stage = HalfBandStage2x::from_spec(8, 0.045);
+        // Banda de paso (0.10 * 96 kHz = 9.6 kHz) plana < 0.01 dB.
+        let pb_db = lin_to_db(stage.magnitude_response_at(0.10) as f32);
+        assert!(pb_db.abs() < 0.01, "passband error too high: {pb_db} dB");
+        // Banda de rechazo (> 0.28 -> ~27 kHz @ 96 kHz) > 85 dB.
+        let sb_db = lin_to_db(stage.magnitude_response_at(0.32) as f32);
+        assert!(sb_db < -85.0, "stopband rejection insufficient: {sb_db} dB");
+
+        // Prueba de aliasing: tono agudo 4,370 Hz con +24 dB de drive sobre tanh(x) @ 48 kHz.
+        const N: usize = 4096;
+        const WARMUP: usize = 1024;
+        let sr = 48_000.0_f32;
+        let (input_full, freq_exact) = generate_coherent_sine(4_370.0, sr, N + WARMUP, 1.0);
+        let drive = db_to_lin(24.0);
+
+        // Referencia sin antialiasing (1x tanh directo).
+        let naive_full: Vec<f32> = input_full
+            .iter()
+            .map(|&x| (x as f64 * drive as f64).tanh() as f32)
+            .collect();
+        let naive_m = compute_harmonic_metrics(
+            &naive_full[WARMUP..],
+            sr,
+            WindowKind::BlackmanHarris4,
+            Some(freq_exact),
+        );
+
+        // HIIR 4x + TanhAdaa1.
+        let mut os = Oversampler::new(sr, 256);
+        assert_eq!(os.factor(), 4);
+        let mut adaa = TanhAdaa1::default();
+        let mut clean_full = input_full.clone();
+        for chunk in clean_full.chunks_mut(256) {
+            os.process_block(chunk, |buf, _| {
+                for s in buf.iter_mut() {
+                    *s = adaa.process_sample(*s * drive as f64);
+                }
+            });
+        }
+        let clean_m = compute_harmonic_metrics(
+            &clean_full[WARMUP..],
+            sr,
+            WindowKind::BlackmanHarris4,
+            Some(freq_exact),
+        );
+
+        let improvement_db = clean_m.aliasing_snr_db - naive_m.aliasing_snr_db;
+        assert!(
+            improvement_db > 25.0,
+            "expected > 25 dB aliasing improvement, got {improvement_db:.2} dB (naive ASNR={:.2}, clean ASNR={:.2})",
+            naive_m.aliasing_snr_db,
+            clean_m.aliasing_snr_db
+        );
+    }
+
+    #[test]
+    fn adaa1_tanh_and_asym_finite_at_extremes_and_even_harmonics() {
+        let mut tanh_adaa = TanhAdaa1::default();
+        for &x in &[
+            0.0_f64, 1e-12, 1e-9, -1e-9, 50.0, -50.0, 1e6, -1e6, 0.25, 0.25,
+        ] {
+            let y = tanh_adaa.process_sample(x);
+            assert!(
+                y.is_finite() && y.abs() <= 1.0001,
+                "bad ADAA1 out {y} for {x}"
+            );
+        }
+
+        const N: usize = 4096;
+        let sr = 48_000.0_f32;
+        let (sine, f0) = generate_coherent_sine(1_000.0, sr, N + 512, 1.0);
+
+        let mut sym = AsymSoftClipAdaa1::new(1.0, 1.0);
+        let sym_out: Vec<f32> = sine
+            .iter()
+            .map(|&x| sym.process_sample(x as f64 * 4.0) as f32)
+            .collect();
+        let sym_m =
+            compute_harmonic_metrics(&sym_out[512..], sr, WindowKind::BlackmanHarris4, Some(f0));
+        assert!(
+            sym_m.even_vs_fund_db < -60.0,
+            "symmetric ADAA1 leaked even harmonics: {} dB",
+            sym_m.even_vs_fund_db
+        );
+
+        let mut asym = AsymSoftClipAdaa1::new(1.8, 0.65);
+        let asym_out: Vec<f32> = sine
+            .iter()
+            .map(|&x| asym.process_sample(x as f64 * 4.0) as f32)
+            .collect();
+        let asym_m =
+            compute_harmonic_metrics(&asym_out[512..], sr, WindowKind::BlackmanHarris4, Some(f0));
+        assert!(
+            asym_m.even_vs_fund_db > -25.0,
+            "asymmetric ADAA1 should yield clear even harmonics: {} dB",
+            asym_m.even_vs_fund_db
+        );
+    }
+
+    #[test]
+    fn svf_tpt_rapid_modulation_remains_stable_and_bounded() {
+        let sr = 48_000.0_f32;
+        let mut svf = SvfTpt::new(sr);
+        let mut max_abs = 0.0_f32;
+        for i in 0..8192 {
+            let phase = (i as f32) * 0.031;
+            let fc = 100.0 + 11_900.0 * (0.5 + 0.5 * phase.sin());
+            svf.set_params(SvfMode::BandPass, fc, 8.0, 0.0);
+            let x = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr).sin() * 0.8;
+            let y = svf.process_sample(x);
+            assert!(y.is_finite(), "SVF exploded at sample {i}");
+            max_abs = max_abs.max(y.abs());
+        }
+        assert!(
+            max_abs > 0.05 && max_abs < 5.0,
+            "unexpected modulated peak {max_abs}"
+        );
+
+        svf.reset();
+        svf.set_params(SvfMode::Bell, 1_500.0, 1.5, 6.0);
+        assert!((svf.magnitude_db_at(1_500.0) - 6.0).abs() < 0.05);
+        assert!(svf.magnitude_db_at(50.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn matched_biquad_no_nyquist_cramping_vs_high_fs() {
+        let mut eq_48 = MatchedBiquad::new(48_000.0);
+        let mut eq_192 = MatchedBiquad::new(192_000.0);
+
+        eq_48.set_params(MatchedFilterKind::HighShelf, 10_000.0, 0.707, 6.0);
+        eq_192.set_params(MatchedFilterKind::HighShelf, 10_000.0, 0.707, 6.0);
+        assert!((eq_48.magnitude_db_at(10_000.0) - 3.0).abs() < 0.15);
+        assert!(
+            (eq_48.magnitude_db_at(20_000.0) - eq_192.magnitude_db_at(20_000.0)).abs() < 0.5,
+            "HighShelf cramped at 20 kHz: 48k={:.2} dB vs 192k={:.2} dB",
+            eq_48.magnitude_db_at(20_000.0),
+            eq_192.magnitude_db_at(20_000.0)
+        );
+
+        eq_48.set_params(MatchedFilterKind::Peaking, 14_000.0, 1.5, 9.0);
+        eq_192.set_params(MatchedFilterKind::Peaking, 14_000.0, 1.5, 9.0);
+        assert!((eq_48.magnitude_db_at(14_000.0) - 9.0).abs() < 0.1);
+        assert!(
+            (eq_48.magnitude_db_at(20_000.0) - eq_192.magnitude_db_at(20_000.0)).abs() < 0.6,
+            "Peaking cramped near Nyquist: 48k={:.2} dB vs 192k={:.2} dB",
+            eq_48.magnitude_db_at(20_000.0),
+            eq_192.magnitude_db_at(20_000.0)
+        );
+
+        // Corte exacto espejo (-9 dB vs +9 dB).
+        let mut eq_cut = MatchedBiquad::new(48_000.0);
+        eq_cut.set_params(MatchedFilterKind::Peaking, 14_000.0, 1.5, -9.0);
+        assert!((eq_48.magnitude_db_at(14_000.0) + eq_cut.magnitude_db_at(14_000.0)).abs() < 0.05);
+    }
+
+    #[test]
+    fn param_spec_stepped_mapping_and_mode_crossfader_smooth() {
+        let spec = ParamSpec {
+            id: "topology",
+            name: "Circuit",
+            unit: "",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+            scale: ParamScale::Stepped {
+                labels: &["Op-Amp", "JFET"],
+            },
+            decimals: 0,
+        };
+        assert_eq!(spec.step_index(0.2), 0);
+        assert_eq!(spec.step_index(0.8), 1);
+        assert_eq!(spec.step_index(99.0), 1);
+        assert_eq!(spec.format_value(0.0), "Op-Amp");
+        assert_eq!(spec.format_value(1.0), "JFET");
+        assert!((spec.to_normalized(1.0) - 1.0).abs() < 1e-6);
+        assert_eq!(spec.from_normalized(0.6), 1.0);
+
+        let mut cf = ModeCrossfader::new(5.0, 48_000.0, 0);
+        assert!(!cf.is_crossfading());
+        cf.set_mode(1);
+        assert!(cf.is_crossfading());
+        assert_eq!(cf.pair(), (0, 1));
+
+        let mut prev_out = 1.0_f32;
+        let mut max_delta = 0.0_f32;
+        for _ in 0..300 {
+            let (g0, g1) = cf.advance_gains();
+            assert!((g0 + g1 - 1.0).abs() < 1e-5);
+            let out = g0 - g1;
+            max_delta = max_delta.max((out - prev_out).abs());
+            prev_out = out;
+        }
+        assert!(!cf.is_crossfading());
+        assert_eq!(cf.active_mode(), 1);
+        assert!(max_delta < 0.05, "crossfade jump too large: {max_delta}");
+    }
+
+    #[test]
+    fn offline_analyzer_metrics_coherent_thd_imd_and_esr() {
+        const N: usize = 4096;
+        let sr = 48_000.0_f32;
+        let (pure, f0) = generate_coherent_sine(1_000.0, sr, N, 0.5);
+        let m_pure = compute_harmonic_metrics(&pure, sr, WindowKind::BlackmanHarris4, Some(f0));
+        assert!(
+            m_pure.thd_db < -85.0,
+            "BH4 pure sine THD floor too high: {} dB",
+            m_pure.thd_db
+        );
+        assert!(
+            m_pure.aliasing_snr_db > 85.0,
+            "BH4 pure sine ASNR too low: {} dB",
+            m_pure.aliasing_snr_db
+        );
+
+        // IMD dos tonos: lineal vs no lineal.
+        let f1 = 220.0_f32;
+        let f2 = 330.0_f32;
+        let two_tone: Vec<f32> = (0..N)
+            .map(|i| {
+                let t = i as f32 / sr;
+                0.35 * (2.0 * std::f32::consts::PI * f1 * t).sin()
+                    + 0.35 * (2.0 * std::f32::consts::PI * f2 * t).sin()
+            })
+            .collect();
+        let imd_lin = compute_imd_db(&two_tone, sr, f1, f2);
+        let nonlin: Vec<f32> = two_tone.iter().map(|&x| (x * 4.0).tanh()).collect();
+        let imd_clip = compute_imd_db(&nonlin, sr, f1, f2);
+        assert!(
+            imd_lin < -65.0,
+            "linear two-tone IMD unexpected: {imd_lin} dB"
+        );
+        assert!(imd_clip > -35.0, "clipped IMD too low: {imd_clip} dB");
+
+        // ESR: idénticos <= -140 dB, diferencia conocida coherente.
+        assert!(compute_esr_db(&pure, &pure) <= -139.0);
+        let shifted: Vec<f32> = pure.iter().map(|&x| x * 0.9).collect();
+        let esr = compute_esr_db(&pure, &shifted);
+        assert!(
+            (esr - (-20.0)).abs() < 0.05,
+            "expected -20 dB ESR, got {esr}"
+        );
     }
 }

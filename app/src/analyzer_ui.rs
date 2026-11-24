@@ -1,13 +1,14 @@
 use std::collections::VecDeque;
 
 use dsp::{
-    compute_spectrum_db, compute_waveform_metrics, find_rising_zero_crossing, WaveformMetrics,
+    compute_harmonic_metrics, compute_spectrum_db_with_window, compute_waveform_metrics,
+    find_rising_zero_crossing, HarmonicMetrics, WaveformMetrics, WindowKind,
 };
 use eframe::egui::{
     self, Align2, Color32, ColorImage, CornerRadius, FontId, Frame, Margin, Pos2, Rect, Sense,
     Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2,
 };
-use engine::Engine;
+use engine::{Engine, Params, TestSignalMode};
 
 const ANALYZER_BUF_LEN: usize = 16_384;
 const FFT_LEN: usize = 4096;
@@ -36,6 +37,7 @@ pub struct AnalyzerState {
     pub relative_ref: bool,
     pub view_mode: TraceView,
     pub waterfall_source: WaterfallSource,
+    pub window_kind: WindowKind,
     pub time_window_ms: f32,
     pub abs_zoom: f32,
 
@@ -48,6 +50,7 @@ pub struct AnalyzerState {
     post_spec_db: Vec<f32>,
     smooth_pre_spec: Vec<f32>,
     smooth_post_spec: Vec<f32>,
+    post_harmonics: HarmonicMetrics,
 
     waterfall_pixels: Vec<Color32>,
     waterfall_tex: Option<TextureHandle>,
@@ -73,16 +76,18 @@ impl AnalyzerState {
             relative_ref: true,
             view_mode: TraceView::Both,
             waterfall_source: WaterfallSource::Post,
+            window_kind: WindowKind::BlackmanHarris4,
             time_window_ms: 10.0,
             abs_zoom: 4.0,
             pre_ring,
             post_ring,
             pre_scratch: vec![0.0; ANALYZER_BUF_LEN],
             post_scratch: vec![0.0; ANALYZER_BUF_LEN],
-            pre_spec_db: vec![-100.0; FFT_BINS],
-            post_spec_db: vec![-100.0; FFT_BINS],
-            smooth_pre_spec: vec![-100.0; FFT_BINS],
-            smooth_post_spec: vec![-100.0; FFT_BINS],
+            pre_spec_db: vec![-120.0; FFT_BINS],
+            post_spec_db: vec![-120.0; FFT_BINS],
+            smooth_pre_spec: vec![-120.0; FFT_BINS],
+            smooth_post_spec: vec![-120.0; FFT_BINS],
+            post_harmonics: HarmonicMetrics::default(),
             waterfall_pixels: vec![Color32::from_rgb(8, 10, 15); WATERFALL_W * WATERFALL_H],
             waterfall_tex: None,
             last_sr: 48_000,
@@ -122,8 +127,22 @@ impl AnalyzerState {
             copy_deque_to_slice(&self.post_ring, &mut self.post_scratch);
 
             let start = self.pre_scratch.len().saturating_sub(FFT_LEN);
-            compute_spectrum_db(&self.pre_scratch[start..], &mut self.pre_spec_db);
-            compute_spectrum_db(&self.post_scratch[start..], &mut self.post_spec_db);
+            compute_spectrum_db_with_window(
+                &self.pre_scratch[start..],
+                &mut self.pre_spec_db,
+                self.window_kind,
+            );
+            compute_spectrum_db_with_window(
+                &self.post_scratch[start..],
+                &mut self.post_spec_db,
+                self.window_kind,
+            );
+            self.post_harmonics = compute_harmonic_metrics(
+                &self.post_scratch[start..],
+                self.last_sr as f32,
+                self.window_kind,
+                None,
+            );
 
             for i in 0..FFT_BINS {
                 let a = if self.pre_spec_db[i] > self.smooth_pre_spec[i] {
@@ -192,7 +211,7 @@ impl AnalyzerState {
         }
     }
 
-    pub fn draw(&mut self, ui: &mut egui::Ui, proc_sr: u32) {
+    pub fn draw(&mut self, ui: &mut egui::Ui, proc_sr: u32, params: &Params) {
         self.last_sr = proc_sr.max(8_000);
 
         Frame::new()
@@ -276,16 +295,87 @@ impl AnalyzerState {
                             ui.selectable_value(&mut self.view_mode, mode, lbl);
                         }
 
-                        ui.label("Ventana:");
+                        ui.label("Tiempo:");
                         for ms in [5.0_f32, 10.0, 25.0] {
                             ui.selectable_value(&mut self.time_window_ms, ms, format!("{ms:.0} ms"));
                         }
+
+                        ui.label("FFT:");
+                        ui.selectable_value(
+                            &mut self.window_kind,
+                            WindowKind::BlackmanHarris4,
+                            "BH4 (-96 dB)",
+                        );
+                        ui.selectable_value(&mut self.window_kind, WindowKind::Hann, "Hann");
                     }
                 });
 
                 if !self.visible {
                     return;
                 }
+
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("🧪 Tonos de prueba:")
+                            .strong()
+                            .size(12.0)
+                            .color(Color32::from_rgb(185, 198, 218)),
+                    );
+                    let current_mode = params.test_signal_mode();
+                    for mode in TestSignalMode::ALL {
+                        let selected = current_mode == mode;
+                        if ui
+                            .selectable_label(selected, mode.label())
+                            .clicked()
+                        {
+                            params.set_test_signal_mode(mode);
+                        }
+                    }
+
+                    if current_mode == TestSignalMode::Sine {
+                        let mut freq = params.test_freq_hz();
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut freq, 60.0..=6000.0)
+                                    .logarithmic(true)
+                                    .suffix(" Hz")
+                                    .text("Freq"),
+                            )
+                            .changed()
+                        {
+                            params.set_test_freq_hz(freq);
+                        }
+                    }
+
+                    if current_mode != TestSignalMode::Off {
+                        let mut level = params.test_level_db();
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut level, -36.0..=-1.0)
+                                    .suffix(" dBFS")
+                                    .text("Nivel"),
+                            )
+                            .changed()
+                        {
+                            params.set_test_level_db(level);
+                        }
+                    }
+
+                    let hm = self.post_harmonics;
+                    if hm.fundamental_db > -80.0 {
+                        ui.separator();
+                        ui.monospace(format!(
+                            "POST  f0:{:>6.0}Hz  THD:{:>5.2}%  H2:{:>5.1}dB  H3:{:>5.1}dB  Par/Imp:{:>+5.1}dB  ASNR:{:>4.1}dB",
+                            hm.fundamental_hz,
+                            hm.thd_percent,
+                            hm.h2_db,
+                            hm.h3_db,
+                            hm.even_odd_ratio_db,
+                            hm.aliasing_snr_db
+                        ));
+                    }
+                });
 
                 ui.add_space(8.0);
 
@@ -469,14 +559,14 @@ fn draw_spectrum_and_waterfall(
                 );
             }
 
-            // Rejilla de dB (-80 .. 0 dB / dBr)
-            let db_min = -80.0_f32;
+            // Rejilla de dB (-96 .. 0 dB / dBr para ver aliasing con Blackman-Harris)
+            let db_min = -96.0_f32;
             let db_max = 3.0_f32;
             let db_to_y = |db: f32| -> f32 {
                 let n = ((db - db_min) / (db_max - db_min)).clamp(0.0, 1.0);
                 spec_rect.max.y - n * spec_rect.height()
             };
-            for db_line in [0.0_f32, -20.0, -40.0, -60.0] {
+            for db_line in [0.0_f32, -24.0, -48.0, -72.0, -96.0] {
                 let y = db_to_y(db_line);
                 p.line_segment(
                     [Pos2::new(spec_rect.min.x, y), Pos2::new(spec_rect.max.x, y)],

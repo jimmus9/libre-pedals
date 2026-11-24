@@ -9,6 +9,40 @@ pub const MAX_MOUNTED_PEDALS: usize = 12;
 pub const PRESET_LEVEL_MIN_DB: f32 = -24.0;
 pub const PRESET_LEVEL_MAX_DB: f32 = 12.0;
 
+/// Modo del generador de tonos de prueba interno para medición en vivo pre/post cadena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum TestSignalMode {
+    Off = 0,
+    Sine = 1,
+    TwoToneImd = 2,
+    AliasingSine = 3,
+}
+
+impl TestSignalMode {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Sine, Self::TwoToneImd, Self::AliasingSine];
+
+    #[inline]
+    pub fn from_usize(v: usize) -> Self {
+        match v {
+            1 => Self::Sine,
+            2 => Self::TwoToneImd,
+            3 => Self::AliasingSine,
+            _ => Self::Off,
+        }
+    }
+
+    #[inline]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Entrada real",
+            Self::Sine => "Seno",
+            Self::TwoToneImd => "2 tonos IMD (220+330)",
+            Self::AliasingSine => "Aliasing (4370 Hz)",
+        }
+    }
+}
+
 /// Resumen de disponibilidad por tipo de pedal en la cadena prealojada.
 #[derive(Debug, Clone)]
 pub struct KindInfo {
@@ -184,6 +218,9 @@ pub struct Params {
     order: Box<[AtomicUsize]>,
     mute: AtomicBool,
     preset_level_db: AtomicF32,
+    test_mode: AtomicUsize,
+    test_freq_hz: AtomicF32,
+    test_level_db: AtomicF32,
 }
 
 impl Default for Params {
@@ -231,6 +268,9 @@ impl Params {
             order: order.into_boxed_slice(),
             mute: AtomicBool::new(mute),
             preset_level_db: AtomicF32::new(0.0),
+            test_mode: AtomicUsize::new(TestSignalMode::Off as usize),
+            test_freq_hz: AtomicF32::new(1000.0),
+            test_level_db: AtomicF32::new(-12.0),
         };
         let initial_mounted: Vec<usize> = params
             .slots
@@ -455,6 +495,46 @@ impl Params {
             0.0
         };
         self.preset_level_db.store(clamped);
+    }
+
+    #[inline]
+    pub fn test_signal_mode(&self) -> TestSignalMode {
+        TestSignalMode::from_usize(self.test_mode.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub fn set_test_signal_mode(&self, mode: TestSignalMode) {
+        self.test_mode.store(mode as usize, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn test_freq_hz(&self) -> f32 {
+        self.test_freq_hz.load()
+    }
+
+    #[inline]
+    pub fn set_test_freq_hz(&self, hz: f32) {
+        let clamped = if hz.is_finite() {
+            hz.clamp(40.0, 10_000.0)
+        } else {
+            1000.0
+        };
+        self.test_freq_hz.store(clamped);
+    }
+
+    #[inline]
+    pub fn test_level_db(&self) -> f32 {
+        self.test_level_db.load()
+    }
+
+    #[inline]
+    pub fn set_test_level_db(&self, db: f32) {
+        let clamped = if db.is_finite() {
+            db.clamp(-48.0, 0.0)
+        } else {
+            -12.0
+        };
+        self.test_level_db.store(clamped);
     }
 
     pub fn set_drive_db(&self, db: f32) {

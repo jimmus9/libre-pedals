@@ -1661,7 +1661,7 @@ impl PedalboardApp {
                         });
 
                         ui.add_space(12.0);
-                        self.analyzer.draw(ui, active_proc_sr);
+                        self.analyzer.draw(ui, active_proc_sr, &self.params);
                     });
             });
     }
@@ -2102,6 +2102,14 @@ fn draw_rotary_knob(
     if response.double_clicked() || response.secondary_clicked() {
         *value = spec.default;
         changed = true;
+    } else if response.clicked() {
+        if let dsp::ParamScale::Stepped { labels } = spec.scale {
+            if !labels.is_empty() {
+                let next_idx = (spec.step_index(*value) + 1) % labels.len();
+                *value = next_idx as f32;
+                changed = true;
+            }
+        }
     } else {
         let mut norm = spec.to_normalized(*value);
         let mut delta = 0.0_f32;
