@@ -14,8 +14,8 @@ use cpal::{
     SupportedBufferSize, SupportedStreamConfig,
 };
 use dsp::{
-    db_to_lin, Chain, CleanBoost, Effect, Gain, NoiseGate, Overdrive, Resampler, ScopedNoDenormals,
-    TubePreamp,
+    db_to_lin, BrickwallLimiter, Chain, CleanBoost, Effect, Gain, NoiseGate, OptoCompressor,
+    Overdrive, Resampler, ScopedNoDenormals, SoftClipTape, TubePreamp,
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -475,10 +475,19 @@ pub fn default_pedalboard_chain() -> Chain {
         chain.push(CleanBoost::new(), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(OptoCompressor::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
         chain.push(Overdrive::new(), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
         chain.push(TubePreamp::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(SoftClipTape::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(BrickwallLimiter::new(), false);
     }
     chain.push(Gain::new(-6.0), false);
     chain

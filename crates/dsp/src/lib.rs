@@ -7,12 +7,15 @@ pub mod d5_experiment;
 pub mod denormals;
 pub mod gain;
 pub mod gate;
+pub mod limiter;
 pub mod matched_eq;
+pub mod opto_comp;
 pub mod overdrive;
 pub mod oversampler;
 pub mod resampler;
 pub mod smoother;
 pub mod svf;
+pub mod tape_limiter;
 pub mod tube_preamp;
 
 pub use adaa::{AsymSoftClipAdaa1, HalfSampleDelay, TanhAdaa1};
@@ -26,12 +29,15 @@ pub use clean_boost::CleanBoost;
 pub use denormals::{flush_denormal, flush_denormal_f64, ScopedNoDenormals};
 pub use gain::Gain;
 pub use gate::NoiseGate;
+pub use limiter::BrickwallLimiter;
 pub use matched_eq::{MatchedBiquad, MatchedFilterKind};
+pub use opto_comp::OptoCompressor;
 pub use overdrive::Overdrive;
 pub use oversampler::{adaptive_oversampling_factor, HalfBandStage2x, Oversampler};
 pub use resampler::Resampler;
 pub use smoother::{ModeCrossfader, OnePoleSmoother};
 pub use svf::{SvfMode, SvfTpt};
+pub use tape_limiter::SoftClipTape;
 pub use tube_preamp::TubePreamp;
 
 /// Conversión de decibelios a ganancia lineal. Valores <= -120 dB se tratan como silencio.
@@ -481,14 +487,18 @@ mod tests {
             .fold(0.0_f32, |acc, &x| acc.max(x.abs()));
         assert!(max_quiet < 1e-5, "expected silence, got max {max_quiet}");
 
-        // 2. Señal fuerte (-6 dB = 0.5) durante 0.25 s -> debe pasar casi intacta tras el ataque.
-        let mut loud: Vec<f32> = (0..12_000)
+        // 2. Señal fuerte (-6 dB = 0.5) durante 0.25 s -> debe pasar casi intacta tras el ataque
+        // (compensando la latencia fija de 1 ms del lookahead).
+        let latency = gate.latency_samples();
+        let raw_loud: Vec<f32> = (0..12_000)
             .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin() * 0.5)
             .collect();
-        let expected_tail: Vec<f32> = loud[6_000..].to_vec();
+        let mut loud = raw_loud.clone();
         gate.process(&mut loud);
-        for (y, x) in loud[6_000..].iter().zip(expected_tail.iter()) {
-            assert!((y - x).abs() < 1e-3, "expected {x}, got {y}");
+        for i in 6_000..12_000 {
+            let y = loud[i];
+            let x = raw_loud[i - latency];
+            assert!((y - x).abs() < 1e-3, "expected {x}, got {y} at {i}");
         }
 
         // 3. Vuelve el ruido bajo durante 1 s -> debe volver a cerrarse.
@@ -638,7 +648,7 @@ mod tests {
 
         let mut gate = NoiseGate::new(-60.0);
         assert_eq!(gate.name(), "Noise Gate");
-        assert_eq!(gate.params().len(), 1);
+        assert_eq!(gate.params().len(), 5);
         gate.set_param(0, -45.0);
         assert!((gate.get_param(0) - (-45.0)).abs() < 1e-6);
 
@@ -1351,6 +1361,553 @@ mod tests {
         assert!(
             max_t - min_t < 1.5,
             "12AX7 THD drifted across sample rates: {thds:?}"
+        );
+    }
+
+    #[test]
+    fn noise_gate_advanced_hysteresis_sidechain_range_lookahead() {
+        let sr = 48_000.0_f32;
+        let t_open = -30.0_f32;
+
+        // 1) Histéresis vs ausencia de histéresis cerca del umbral.
+        let run_chatter = |hyst_db: f32| -> usize {
+            let mut g = NoiseGate::new(t_open);
+            g.prepare(sr, 64);
+            g.set_hysteresis_db(hyst_db);
+            g.set_hold_ms(0.0);
+            g.set_release_ms(50.0);
+
+            let mut transitions = 0usize;
+            let mut prev_open = g.is_open();
+
+            // 150 ms por encima del umbral para abrir.
+            let open_samples = (0.150 * sr) as usize;
+            for i in 0..open_samples {
+                let s =
+                    db_to_lin(-20.0) * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / sr).sin();
+                let mut sample = [s];
+                g.process(&mut sample);
+                if g.is_open() != prev_open {
+                    transitions += 1;
+                    prev_open = g.is_open();
+                }
+            }
+
+            // 1.2 s oscilando 3 Hz alrededor de T - 1 dB (-34..-28 dBFS).
+            let mod_samples = (1.200 * sr) as usize;
+            for i in 0..mod_samples {
+                let t = i as f32 / sr;
+                let amp_db = t_open - 1.0 + 3.0 * (2.0 * std::f32::consts::PI * 3.0 * t).sin();
+                let s = db_to_lin(amp_db) * (2.0 * std::f32::consts::PI * 1_000.0 * t).sin();
+                let mut sample = [s];
+                g.process(&mut sample);
+                if g.is_open() != prev_open {
+                    transitions += 1;
+                    prev_open = g.is_open();
+                }
+            }
+            transitions
+        };
+
+        let trans_hyst = run_chatter(6.0);
+        let trans_no_hyst = run_chatter(0.0);
+        assert_eq!(
+            trans_hyst, 1,
+            "hysteresis failed to stop chatter: {trans_hyst}"
+        );
+        assert!(
+            trans_no_hyst >= 4,
+            "expected chatter without hysteresis, got {trans_no_hyst}"
+        );
+
+        // 2) Sidechain interno (120 Hz HP 4º orden): rechaza zumbido 60 Hz @ -30 dBFS (T=-40).
+        let mut g_sc = NoiseGate::new(-40.0);
+        g_sc.prepare(sr, 256);
+        let mut hum: Vec<f32> = (0..48_000)
+            .map(|i| db_to_lin(-30.0) * (2.0 * std::f32::consts::PI * 60.0 * i as f32 / sr).sin())
+            .collect();
+        for ch in hum.chunks_mut(256) {
+            g_sc.process(ch);
+        }
+        let max_hum = hum[24_000..].iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+        assert!(max_hum < 1e-5, "60 Hz hum opened gate: max={max_hum}");
+
+        g_sc.reset();
+        let tone_1k: Vec<f32> = (0..24_000)
+            .map(|i| {
+                db_to_lin(-30.0) * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / sr).sin()
+            })
+            .collect();
+        let mut out_1k = tone_1k.clone();
+        for ch in out_1k.chunks_mut(256) {
+            g_sc.process(ch);
+        }
+        let rms_in = compute_waveform_metrics(&tone_1k[12_000..]).rms_db;
+        let rms_out = compute_waveform_metrics(&out_1k[12_000..]).rms_db;
+        assert!(
+            (rms_out - rms_in).abs() < 0.2,
+            "1 kHz signal attenuated by gate: diff={}",
+            rms_out - rms_in
+        );
+
+        // 3) Range (-20 dB): señal por debajo del umbral se atenúa exactamente -20 ± 0.5 dB.
+        let mut g_rng = NoiseGate::new(-30.0);
+        g_rng.prepare(sr, 256);
+        g_rng.set_range_db(-20.0);
+        let quiet_sig: Vec<f32> = (0..48_000)
+            .map(|i| {
+                db_to_lin(-50.0) * (2.0 * std::f32::consts::PI * 1_000.0 * i as f32 / sr).sin()
+            })
+            .collect();
+        let mut quiet_out = quiet_sig.clone();
+        for ch in quiet_out.chunks_mut(256) {
+            g_rng.process(ch);
+        }
+        let rng_diff = compute_waveform_metrics(&quiet_out[36_000..]).rms_db
+            - compute_waveform_metrics(&quiet_sig[36_000..]).rms_db;
+        assert!(
+            (rng_diff - (-20.0)).abs() < 0.5,
+            "gate range attenuation unexpected: {rng_diff} dB"
+        );
+
+        // 4) Lookahead fijo 1 ms: latencia exacta y preservación del ataque inicial.
+        let mut g_la_192 = NoiseGate::new(-40.0);
+        g_la_192.prepare(192_000.0, 256);
+        assert_eq!(g_la_192.latency_samples(), 192);
+
+        let mut g_la = NoiseGate::new(-40.0);
+        g_la.prepare(sr, 128);
+        let lat = g_la.latency_samples();
+        assert_eq!(lat, 48);
+
+        let onset = 2_400usize;
+        let mut burst_in = vec![0.0_f32; 4_800];
+        for (i, slot) in burst_in.iter_mut().enumerate().skip(onset) {
+            *slot = db_to_lin(-10.0)
+                * (2.0 * std::f32::consts::PI * 1_000.0 * (i - onset) as f32 / sr).sin();
+        }
+        let mut burst_out = burst_in.clone();
+        for ch in burst_out.chunks_mut(128) {
+            g_la.process(ch);
+        }
+        let e_in: f64 = burst_in[onset..onset + 96]
+            .iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum();
+        let e_out: f64 = burst_out[onset + lat..onset + lat + 96]
+            .iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum();
+        assert!(
+            e_out / e_in > 0.75,
+            "lookahead clipped initial transient: ratio = {:.3}",
+            e_out / e_in
+        );
+    }
+
+    #[test]
+    fn opto_comp_two_stage_release_program_dependence_and_low_thd() {
+        let sr = 48_000.0_f32;
+        let block = 48usize; // 1 ms por bloque
+
+        let run_burst_recovery = |burst_ms: usize| -> (f32, f32, f32) {
+            let mut comp = OptoCompressor::new();
+            comp.prepare(sr, block);
+            comp.set_peak_reduction(80.0);
+            comp.set_mode(0.0); // Compress
+            comp.set_mix(100.0);
+            comp.set_gain_db(0.0);
+
+            let mut phase = 0usize;
+            for _ in 0..burst_ms {
+                let mut b = [0.0_f32; 48];
+                for s in &mut b {
+                    *s = 0.5 * (2.0 * std::f32::consts::PI * 1_000.0 * phase as f32 / sr).sin();
+                    phase += 1;
+                }
+                comp.process(&mut b);
+            }
+            let g0 = comp.gain_reduction_db();
+
+            let mut gr_150 = 0.0_f32;
+            let mut gr_1000 = 0.0_f32;
+            for ms in 1..=1000 {
+                let mut sil = [0.0_f32; 48];
+                comp.process(&mut sil);
+                if ms == 150 {
+                    gr_150 = comp.gain_reduction_db();
+                } else if ms == 1000 {
+                    gr_1000 = comp.gain_reduction_db();
+                }
+            }
+            (g0, gr_150, gr_1000)
+        };
+
+        let (g0_short, gr150_short, gr1000_short) = run_burst_recovery(300);
+        assert!(g0_short > 6.0, "expected G0 > 6 dB, got {g0_short}");
+        let recov_150 = 1.0 - gr150_short / g0_short;
+        assert!(
+            (0.35..=0.75).contains(&recov_150),
+            "initial recovery at +150 ms outside [0.35, 0.75]: {recov_150}"
+        );
+
+        let (g0_long, _, gr1000_long) = run_burst_recovery(4000);
+        let res_short = gr1000_short / g0_short;
+        let res_long = gr1000_long / g0_long;
+        assert!(
+            res_long > res_short + 0.10,
+            "program-dependent tail not slower after long burst: res_long={res_long:.3}, res_short={res_short:.3}"
+        );
+
+        // THD en cuerda Mi grave (82.41 Hz): sin modulación de onda (< 1.5%).
+        let mut comp_thd = OptoCompressor::new();
+        comp_thd.prepare(sr, 256);
+        comp_thd.set_peak_reduction(60.0);
+        comp_thd.set_mode(0.0);
+        comp_thd.set_mix(100.0);
+        comp_thd.set_gain_db(0.0);
+
+        let warm = 48_000usize;
+        let win = 8_192usize;
+        let (mut sig_low, f_low) = generate_coherent_sine(82.41, sr, warm + win, 0.5);
+        for ch in sig_low.chunks_mut(256) {
+            comp_thd.process(ch);
+        }
+        let gr_low = comp_thd.gain_reduction_db();
+        assert!(gr_low > 3.0, "expected GR > 3 dB at 82.41 Hz, got {gr_low}");
+        let hm = compute_harmonic_metrics(
+            &sig_low[warm..],
+            sr,
+            WindowKind::BlackmanHarris4,
+            Some(f_low),
+        );
+        assert!(
+            hm.thd_percent < 1.5,
+            "OptoComp low-frequency THD too high: {}%",
+            hm.thd_percent
+        );
+
+        // Mix = 0% igual a señal seca * makeup; Limit produce más GR que Compress.
+        let mut comp_mix = OptoCompressor::new();
+        comp_mix.prepare(sr, 128);
+        comp_mix.set_peak_reduction(90.0);
+        comp_mix.set_gain_db(6.0);
+        comp_mix.set_mix(0.0);
+        comp_mix.reset();
+        let dry: Vec<f32> = (0..1024).map(|i| 0.4 * (i as f32 * 0.1).sin()).collect();
+        let mut out_mix = dry.clone();
+        comp_mix.process(&mut out_mix);
+        let g_mk = db_to_lin(6.0);
+        let max_diff = dry
+            .iter()
+            .zip(out_mix.iter())
+            .fold(0.0_f32, |m, (&x, &y)| m.max((y - x * g_mk).abs()));
+        assert!(
+            max_diff < 1e-5,
+            "Mix=0 leaked wet signal: max_diff={max_diff}"
+        );
+
+        let measure_mode_gr = |mode_val: f32| -> f32 {
+            let mut c = OptoCompressor::new();
+            c.prepare(sr, 256);
+            c.set_peak_reduction(70.0);
+            c.set_mode(mode_val);
+            c.set_gain_db(0.0);
+            let mut b: Vec<f32> = (0..24_000)
+                .map(|i| 0.8 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr).sin())
+                .collect();
+            for ch in b.chunks_mut(256) {
+                c.process(ch);
+            }
+            c.gain_reduction_db()
+        };
+        assert!(measure_mode_gr(1.0) > measure_mode_gr(0.0) + 1.0);
+    }
+
+    #[test]
+    fn brickwall_limiter_true_peak_zero_overshoot_and_fs_invariance() {
+        let ceiling_db = -1.0_f32;
+        let c_lin = db_to_lin(ceiling_db);
+
+        // 1) ISP: seno a fs/4 (12 kHz @ 48 kHz) con fase pi/4 y amplitud 1.4 (+2.9 dBTP).
+        let sr48 = 48_000.0_f32;
+        let mut lim = BrickwallLimiter::new();
+        lim.prepare(sr48, 256);
+        lim.set_drive_db(0.0);
+        lim.set_ceiling_db(ceiling_db);
+        lim.set_release_ms(120.0);
+
+        let n_isp = 24_000usize;
+        let mut isp_buf: Vec<f32> = (0..n_isp)
+            .map(|i| {
+                let phase = std::f32::consts::FRAC_PI_4 + std::f32::consts::FRAC_PI_2 * (i as f32);
+                1.4 * phase.sin()
+            })
+            .collect();
+        for ch in isp_buf.chunks_mut(256) {
+            lim.process(ch);
+        }
+        let steady = &isp_buf[12_000..];
+        let max_steady = steady.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+        assert!(
+            max_steady <= c_lin + 1e-6,
+            "ISP steady peak exceeded ceiling: {max_steady} > {c_lin}"
+        );
+        assert!(
+            max_steady <= 0.75 * c_lin,
+            "sample peak did not reflect true-peak reduction (expected <= {:.4}, got {max_steady})",
+            0.75 * c_lin
+        );
+
+        // Estima True-Peak de salida mediante interpolación sinc Hann 64 taps a 8x.
+        let mut max_tp_out = 0.0_f64;
+        for i in 40..(steady.len() - 40) {
+            max_tp_out = max_tp_out.max((steady[i] as f64).abs());
+            for p in 1..8 {
+                let frac = p as f64 / 8.0;
+                let mut acc = 0.0_f64;
+                let mut wsum = 0.0_f64;
+                for k in -31_isize..=32 {
+                    let t = frac - k as f64;
+                    let sinc = if t.abs() < 1e-12 {
+                        1.0
+                    } else {
+                        (std::f64::consts::PI * t).sin() / (std::f64::consts::PI * t)
+                    };
+                    let win = 0.5 * (1.0 + (std::f64::consts::PI * t / 32.5).cos());
+                    let h = sinc * win;
+                    wsum += h;
+                    acc += h * steady[(i as isize + k) as usize] as f64;
+                }
+                max_tp_out = max_tp_out.max((acc / wsum).abs());
+            }
+        }
+        assert!(
+            max_tp_out <= 1.02 * c_lin as f64,
+            "output true-peak exceeded 1.02*C: {max_tp_out} > {}",
+            1.02 * c_lin as f64
+        );
+
+        // 2) 0.00 dB overshoot + latencia exacta e invarianza en {44.1, 48, 96, 192 kHz} + release.
+        for &(sr, expected_lat) in &[
+            (44_100.0_f32, 74usize),
+            (48_000.0, 80),
+            (96_000.0, 152),
+            (192_000.0, 288),
+        ] {
+            let mut l = BrickwallLimiter::new();
+            l.prepare(sr, 256);
+            assert_eq!(
+                l.latency_samples(),
+                expected_lat,
+                "unexpected limiter latency at {sr} Hz"
+            );
+            let rel_ms = 80.0_f32;
+            l.set_drive_db(6.0);
+            l.set_ceiling_db(ceiling_db);
+            l.set_release_ms(rel_ms);
+
+            let seg = (0.15 * sr) as usize;
+            let rel_tail = (0.40 * sr) as usize;
+            let total = seg * 2 + rel_tail;
+            let mut sig = Vec::with_capacity(total);
+            for i in 0..total {
+                let amp_db = if i < seg {
+                    -20.0
+                } else if i < 2 * seg {
+                    6.0
+                } else {
+                    -30.0
+                };
+                let t = i as f32 / sr;
+                let w = 0.6 * (2.0 * std::f32::consts::PI * 1_000.0 * t).sin()
+                    + 0.4 * (2.0 * std::f32::consts::PI * 3_300.0 * t).sin();
+                sig.push(db_to_lin(amp_db) * w);
+            }
+            let drive_lin = db_to_lin(6.0);
+            let mut out = sig.clone();
+            for ch in out.chunks_mut(256) {
+                l.process(ch);
+            }
+
+            let max_all = out.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+            assert!(
+                max_all <= c_lin + 1e-6,
+                "overshoot at {sr} Hz: {max_all} > {c_lin}"
+            );
+
+            let check_start =
+                2 * seg + ((3.0 * rel_ms * 1e-3) * sr).round() as usize + expected_lat;
+            let check_end = (check_start + (0.04 * sr) as usize).min(total);
+            let rms_out = compute_waveform_metrics(&out[check_start..check_end]).rms_db;
+            let delayed_ref: Vec<f32> = sig
+                [(check_start - expected_lat)..(check_end - expected_lat)]
+                .iter()
+                .map(|&x| x * drive_lin)
+                .collect();
+            let rms_ref = compute_waveform_metrics(&delayed_ref).rms_db;
+            assert!(
+                (rms_out - rms_ref).abs() < 0.5,
+                "limiter did not recover within 0.5 dB at {sr} Hz: out={rms_out}, ref={rms_ref}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_clip_tape_transfer_adaa_and_tape_hf_compression() {
+        const WARMUP: usize = 2048;
+        const N: usize = 4096;
+        let sr = 48_000.0_f32;
+        let ceiling_db = -1.0_f32;
+        let c_lin = db_to_lin(ceiling_db);
+
+        // 1) Soft Clip a bajo nivel (-30 dBFS, Drive 0 dB): lineal y THD < -80 dB.
+        let mut sc = SoftClipTape::new();
+        sc.prepare(sr, 256);
+        sc.set_mode(0.0);
+        sc.set_drive_db(0.0);
+        sc.set_ceiling_db(ceiling_db);
+        sc.set_knee_pct(50.0);
+
+        let (low_s, f_low) = generate_coherent_sine(1_000.0, sr, WARMUP + N, db_to_lin(-30.0));
+        let mut low_out = low_s.clone();
+        for ch in low_out.chunks_mut(256) {
+            sc.process(ch);
+        }
+        let rms_err = (compute_waveform_metrics(&low_out[WARMUP..]).rms_db
+            - compute_waveform_metrics(&low_s[WARMUP..]).rms_db)
+            .abs();
+        assert!(
+            rms_err < 0.05,
+            "Soft Clip low-level gain error: {rms_err} dB"
+        );
+        let hm_low = compute_harmonic_metrics(
+            &low_out[WARMUP..],
+            sr,
+            WindowKind::BlackmanHarris4,
+            Some(f_low),
+        );
+        assert!(
+            hm_low.thd_db < -80.0,
+            "Soft Clip low-level THD too high: {} dB",
+            hm_low.thd_db
+        );
+
+        // 2) Compresión hacia el techo: Drive 6 <= 1.08*C, Drive 24 <= 1.35*C, ΔRMS < 1.5 dB.
+        let mut run_drive = |drv: f32| -> (f32, f32) {
+            sc.reset();
+            sc.set_drive_db(drv);
+            let (s_in, _) = generate_coherent_sine(1_000.0, sr, WARMUP + N, 0.5);
+            let mut s_out = s_in;
+            for ch in s_out.chunks_mut(256) {
+                sc.process(ch);
+            }
+            let max_v = s_out.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+            let rms = compute_waveform_metrics(&s_out[WARMUP..]).rms_db;
+            (max_v, rms)
+        };
+        let (max6, _) = run_drive(6.0);
+        let (_, rms12) = run_drive(12.0);
+        let (max24, rms24) = run_drive(24.0);
+        assert!(
+            max6 <= 1.08 * c_lin,
+            "Drive 6 peak {max6} > {}",
+            1.08 * c_lin
+        );
+        assert!(
+            max24 <= 1.35 * c_lin,
+            "Drive 24 peak {max24} > {}",
+            1.35 * c_lin
+        );
+        assert!(
+            rms24 - rms12 < 1.5,
+            "RMS did not saturate cleanly: rms24={rms24}, rms12={rms12}"
+        );
+
+        // 3) Rechazo de aliasing (> 20 dB vs hard clip 1x en 4370 Hz, Drive 18 dB) en 44.1 y 48 kHz.
+        for &test_sr in &[44_100.0_f32, 48_000.0] {
+            let (base_hi, f_hi) = generate_coherent_sine(4_370.0, test_sr, N, 0.5);
+            let hi: Vec<f32> = base_hi.iter().copied().cycle().take(WARMUP + N).collect();
+            let g18 = db_to_lin(18.0);
+            let hard_1x: Vec<f32> = hi.iter().map(|&x| (x * g18).clamp(-c_lin, c_lin)).collect();
+            let hm_hard = compute_harmonic_metrics(
+                &hard_1x[WARMUP..],
+                test_sr,
+                WindowKind::BlackmanHarris4,
+                Some(f_hi),
+            );
+
+            let mut sc_test = SoftClipTape::new();
+            sc_test.prepare(test_sr, 256);
+            sc_test.set_mode(0.0);
+            sc_test.set_ceiling_db(ceiling_db);
+            sc_test.set_knee_pct(50.0);
+            sc_test.set_drive_db(18.0);
+            let mut sc_hi = hi;
+            for ch in sc_hi.chunks_mut(256) {
+                sc_test.process(ch);
+            }
+            let hm_sc = compute_harmonic_metrics(
+                &sc_hi[WARMUP..],
+                test_sr,
+                WindowKind::BlackmanHarris4,
+                Some(f_hi),
+            );
+            let asnr_gain = hm_sc.aliasing_snr_db - hm_hard.aliasing_snr_db;
+            assert!(
+                asnr_gain > 20.0,
+                "SoftClip aliasing improvement < 20 dB at {test_sr} Hz: +{asnr_gain:.2} dB (hard={:.2}, sc={:.2})",
+                hm_hard.aliasing_snr_db,
+                hm_sc.aliasing_snr_db
+            );
+        }
+
+        // 4) Tape: lineal/plano a -40 dBFS; compresión en agudos a +12 dB drive; H2 > -50 dB.
+        let mut tape = SoftClipTape::new();
+        tape.prepare(sr, 256);
+        tape.set_mode(1.0);
+        tape.set_ceiling_db(ceiling_db);
+        tape.set_knee_pct(75.0);
+
+        let gain_at =
+            |tp: &mut SoftClipTape, freq: f32, amp: f32, drv: f32| -> (f32, HarmonicMetrics) {
+                tp.reset();
+                tp.set_drive_db(drv);
+                let (s_in, f_ex) = generate_coherent_sine(freq, sr, WARMUP + N, amp);
+                let in_db = compute_waveform_metrics(&s_in[WARMUP..]).rms_db;
+                let mut s_out = s_in;
+                for ch in s_out.chunks_mut(256) {
+                    tp.process(ch);
+                }
+                let out_db = compute_waveform_metrics(&s_out[WARMUP..]).rms_db;
+                let hm = compute_harmonic_metrics(
+                    &s_out[WARMUP..],
+                    sr,
+                    WindowKind::BlackmanHarris4,
+                    Some(f_ex),
+                );
+                (out_db - in_db, hm)
+            };
+
+        let (g_200_low, _) = gain_at(&mut tape, 200.0, db_to_lin(-40.0), 0.0);
+        let (g_6k_low, _) = gain_at(&mut tape, 6_000.0, db_to_lin(-40.0), 0.0);
+        assert!(
+            (g_6k_low - g_200_low).abs() < 0.5,
+            "Tape not flat at -40 dBFS: 200Hz={g_200_low}, 6kHz={g_6k_low}"
+        );
+
+        let (g_200_hot, _) = gain_at(&mut tape, 200.0, db_to_lin(-12.0), 12.0);
+        let (g_6k_hot, _) = gain_at(&mut tape, 6_000.0, db_to_lin(-12.0), 12.0);
+        assert!(
+            g_200_hot - g_6k_hot > 1.5,
+            "Tape HF compression too weak: 200Hz={g_200_hot}, 6kHz={g_6k_hot}"
+        );
+
+        let (_, hm_tape) = gain_at(&mut tape, 1_000.0, db_to_lin(-12.0), 12.0);
+        assert!(
+            hm_tape.h2_db > -50.0,
+            "Tape should generate even harmonic H2 > -50 dB: {}",
+            hm_tape.h2_db
         );
     }
 }

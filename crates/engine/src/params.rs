@@ -588,12 +588,13 @@ impl Params {
 
     pub fn set_gate_threshold_db(&self, db: f32) {
         if let Some((_, s)) = self.first_slot_of_kind("noise_gate") {
-            s.set(0, db);
+            s.set_by_id("threshold_db", db);
         }
     }
     pub fn gate_threshold_db(&self) -> f32 {
         self.first_slot_of_kind("noise_gate")
-            .map_or(-60.0, |(_, s)| s.get(0))
+            .and_then(|(_, s)| s.get_by_id("threshold_db"))
+            .unwrap_or(-60.0)
     }
 
     pub fn set_volume_db(&self, db: f32) {
@@ -709,12 +710,15 @@ mod tests {
     #[test]
     fn params_mounting_and_master_separation_keep_master_last() {
         let params = Params::default();
-        assert_eq!(params.slot_count(), 4 * MAX_INSTANCES_PER_KIND + 1);
+        assert_eq!(params.slot_count(), 7 * MAX_INSTANCES_PER_KIND + 1);
         let kinds: Vec<&str> = params.kinds().into_iter().map(|k| k.kind).collect();
         assert!(kinds.contains(&"noise_gate"));
         assert!(kinds.contains(&"clean_boost"));
+        assert!(kinds.contains(&"opto_comp"));
         assert!(kinds.contains(&"overdrive"));
         assert!(kinds.contains(&"tube_preamp"));
+        assert!(kinds.contains(&"soft_clipper"));
+        assert!(kinds.contains(&"limiter"));
         let master = params.master_slot().expect("master slot");
         assert_eq!(master.name, "Master Volume");
         assert_eq!(master.kind, "master_volume");

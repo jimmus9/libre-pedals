@@ -252,8 +252,8 @@ impl Oversampler {
             sample_rate: 48_000.0,
             // Etapa interna más estrecha (~22.6 kHz paso a 48 kHz base -> ~95+ dB rechazo).
             stage1: HalfBandStage2x::from_spec(8, 0.045),
-            // Etapa intermedia (2x -> 4x) con transición amplia para mínima CPU.
-            stage2: HalfBandStage2x::from_spec(4, 0.25),
+            // Etapa intermedia (2x -> 4x) con rechazo profundo entre 72 y 96 kHz.
+            stage2: HalfBandStage2x::from_spec(6, 0.20),
             // Etapa externa (4x -> 8x) ultraligera.
             stage3: HalfBandStage2x::from_spec(3, 0.35),
             buf_a: Vec::new(),

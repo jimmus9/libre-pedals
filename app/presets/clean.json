@@ -2,14 +2,18 @@
   "format_version": 1,
   "name": "Clean",
   "author": "libre-pedals",
-  "description": "Señal limpia con puerta de ruido suave",
+  "description": "Señal limpia con puerta de ruido avanzada e histéresis suave",
   "chain": [
     {
       "id": "noise_gate-1",
       "pedal": "noise_gate",
       "enabled": true,
       "params": {
-        "threshold_db": -65.0
+        "threshold_db": -65.0,
+        "hysteresis_db": 6.0,
+        "hold_ms": 60.0,
+        "release_ms": 150.0,
+        "range_db": -80.0
       }
     }
   ],

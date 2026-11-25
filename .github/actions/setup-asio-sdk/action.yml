@@ -1,0 +1,135 @@
+name: Setup ASIO SDK and LLVM
+description: Downloads, validates, and extracts Steinberg ASIO SDK via PowerShell 7 and exports CPAL_ASIO_DIR and LIBCLANG_PATH.
+
+runs:
+  using: composite
+  steps:
+    - name: Verify LLVM libclang and setup Steinberg ASIO SDK
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+
+        $llvmBin = 'C:\Program Files\LLVM\bin'
+        $libclangPath = Join-Path $llvmBin 'libclang.dll'
+        if (-not (Test-Path -LiteralPath $libclangPath -PathType Leaf)) {
+          throw "Required LLVM library not found at '$libclangPath'."
+        }
+
+        if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+          throw 'RUNNER_TEMP environment variable is not set.'
+        }
+        if ([string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
+          throw 'GITHUB_ENV environment variable is not set.'
+        }
+
+        $url = 'https://www.steinberg.net/asiosdk'
+        $zipPath = Join-Path $env:RUNNER_TEMP 'asiosdk.zip'
+        $sdkRoot = Join-Path $env:RUNNER_TEMP 'asio_sdk_extract'
+        $minSizeBytes = 102400
+        $maxAttempts = 3
+
+        function Get-ReadablePreview {
+          param([string]$Path, [int]$MaxBytes = 512)
+          if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            return '<file does not exist>'
+          }
+          $fs = [System.IO.File]::OpenRead($Path)
+          try {
+            $buffer = New-Object byte[] $MaxBytes
+            $read = $fs.Read($buffer, 0, $MaxBytes)
+            if ($read -le 0) {
+              return '<empty response>'
+            }
+            $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+            return ($text -replace '[^\x20-\x7E\r\n]', '.')
+          } finally {
+            $fs.Dispose()
+          }
+        }
+
+        $lastError = $null
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+          try {
+            if (Test-Path -LiteralPath $zipPath) {
+              Remove-Item -LiteralPath $zipPath -Force
+            }
+
+            Write-Host "Downloading ASIO SDK from $url (attempt $attempt/$maxAttempts)..."
+            Invoke-WebRequest -Uri $url -OutFile $zipPath -MaximumRedirection 10 -TimeoutSec 120
+
+            if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+              throw "Download completed without creating '$zipPath'."
+            }
+
+            $fileInfo = Get-Item -LiteralPath $zipPath
+            if ($fileInfo.Length -lt $minSizeBytes) {
+              $preview = Get-ReadablePreview -Path $zipPath
+              throw "Downloaded ASIO SDK archive is too small ($($fileInfo.Length) bytes < $minSizeBytes bytes). Response preview:`n$preview"
+            }
+
+            $header = New-Object byte[] 4
+            $fs = [System.IO.File]::OpenRead($zipPath)
+            try {
+              $bytesRead = $fs.Read($header, 0, 4)
+            } finally {
+              $fs.Dispose()
+            }
+
+            $isZip = ($bytesRead -eq 4) -and ($header[0] -eq 0x50) -and ($header[1] -eq 0x4B) -and ($header[2] -eq 0x03) -and ($header[3] -eq 0x04)
+            if (-not $isZip) {
+              $hexHeader = if ($bytesRead -gt 0) {
+                ($header[0..($bytesRead - 1)] | ForEach-Object { $_.ToString('X2') }) -join ' '
+              } else {
+                '<empty>'
+              }
+              $preview = Get-ReadablePreview -Path $zipPath
+              throw "Downloaded file at '$zipPath' does not have a valid ZIP magic header (got '$hexHeader', expected '50 4B 03 04'). Response preview:`n$preview"
+            }
+
+            $lastError = $null
+            break
+          } catch {
+            $lastError = $_
+            Write-Warning "Attempt $attempt/$maxAttempts failed: $($_.Exception.Message)"
+            if ($attempt -lt $maxAttempts) {
+              Start-Sleep -Seconds (2 * $attempt)
+            }
+          }
+        }
+
+        if ($null -ne $lastError) {
+          throw $lastError
+        }
+
+        if (Test-Path -LiteralPath $sdkRoot) {
+          Remove-Item -LiteralPath $sdkRoot -Recurse -Force
+        }
+        New-Item -ItemType Directory -Force -Path $sdkRoot | Out-Null
+
+        Write-Host "Extracting '$zipPath' to '$sdkRoot'..."
+        Expand-Archive -Path $zipPath -DestinationPath $sdkRoot -Force
+
+        $candidates = @((Get-Item -LiteralPath $sdkRoot)) + @(Get-ChildItem -LiteralPath $sdkRoot -Directory -Recurse)
+        $resolvedSdkDir = $null
+        foreach ($dir in $candidates) {
+          $hasAsioH = Test-Path -LiteralPath (Join-Path $dir.FullName 'common\asio.h') -PathType Leaf
+          $hasAsioSysH = Test-Path -LiteralPath (Join-Path $dir.FullName 'common\asiosys.h') -PathType Leaf
+          $hasAsioDriversH = Test-Path -LiteralPath (Join-Path $dir.FullName 'host\asiodrivers.h') -PathType Leaf
+          $hasHostPc = Test-Path -LiteralPath (Join-Path $dir.FullName 'host\pc') -PathType Container
+          if ($hasAsioH -and $hasAsioSysH -and $hasAsioDriversH -and $hasHostPc) {
+            $resolvedSdkDir = $dir.FullName
+            break
+          }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($resolvedSdkDir)) {
+          $tree = (Get-ChildItem -LiteralPath $sdkRoot -Recurse -Depth 2 | Select-Object -ExpandProperty FullName) -join "`n"
+          throw "Failed to locate ASIO SDK root directory containing immediate common/asio.h, common/asiosys.h, host/asiodrivers.h, and host/pc inside '$sdkRoot'. Extracted contents:`n$tree"
+        }
+
+        Write-Host "Resolved CPAL_ASIO_DIR=$resolvedSdkDir"
+        Write-Host "Verified LIBCLANG_PATH=$llvmBin"
+
+        "CPAL_ASIO_DIR=$resolvedSdkDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append

@@ -1,0 +1,42 @@
+{
+  "format_version": 1,
+  "name": "Clean Comp (Opto + Limiter)",
+  "author": "libre-pedals",
+  "description": "Limpio con puerta de ruido avanzada, compresión óptica T4B paralela y protección Brickwall True-Peak",
+  "chain": [
+    {
+      "id": "noise_gate-1",
+      "pedal": "noise_gate",
+      "enabled": true,
+      "params": {
+        "threshold_db": -62.0,
+        "hysteresis_db": 6.0,
+        "hold_ms": 60.0,
+        "release_ms": 150.0,
+        "range_db": -80.0
+      }
+    },
+    {
+      "id": "opto_comp-1",
+      "pedal": "opto_comp",
+      "enabled": true,
+      "params": {
+        "peak_reduction": 55.0,
+        "gain_db": 6.0,
+        "mode": 0.0,
+        "mix": 85.0
+      }
+    },
+    {
+      "id": "limiter-1",
+      "pedal": "limiter",
+      "enabled": true,
+      "params": {
+        "drive_db": 3.0,
+        "ceiling_db": -1.0,
+        "release_ms": 150.0
+      }
+    }
+  ],
+  "preset_level_db": 0.0
+}

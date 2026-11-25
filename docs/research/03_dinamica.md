@@ -1,6 +1,6 @@
 # Capítulo 3 — Procesadores de Dinámica
 
-> **Estado:** ✅ Cerrado (`v1.1` — decisiones `D9`–`D12` aprobadas todas en Opción A; revisable si capítulos posteriores lo requieren).  
+> **Estado:** ✅ Cerrado e implementado (`v1.2` — decisiones `D9`–`D12` en Opción A implementadas en Ola 3).  
 > **Pedales cubiertos:** Noise Gate avanzado *(reemplazo del actual)* · Compresor Óptico *(estilo LA-2A / celda T4B)* · Limitador *Brickwall* con *Lookahead* y *True-Peak* · Soft Clipper / Limitador de Cinta (*Tape Limiter*).  
 > **Base previa aplicada:** filtros *sidechain* Cytomic SVF-TPT, parámetro discreto `Stepped` con *crossfade* ($5\text{–}10\text{ ms}$), acumulación `f64` y protección contra *denormals*.
 
@@ -143,3 +143,35 @@ En **Chowdhury (DAFx-19, *"Real-time Physical Modelling for Analog Tape Machines
 | **D10** | **`Compresor Óptico` (LA-2A)** | **A)** Controles clásicos: `Peak Reduction`, `Gain`, selector `Stepped` (`Compress` / `Limit`) y perilla `Mix` (paralela), gobernados por el modelo dual-stage RC + memoria CdS<br>**B)** Añadir además perillas manuales de `Attack` y `Release` | ✅ **Opción A** |
 | **D11** | **`Limitador Brickwall`** | **A)** *Lookahead* fijo de **$1.5\text{ ms}$** (mínima latencia en vivo, *True-Peak* adaptativo y $0.00\text{ dB}$ *overshoot*) + 3 perillas (`Drive/Input`, `Ceiling`, `Release`)<br>**B)** Añadir selector de *lookahead* (`1.5 ms` en vivo / `5 ms` mastering) | ✅ **Opción A** |
 | **D12** | **`Soft Clipper / Tape Limiter`** | **A)** Pedal único con `Drive`, `Ceiling`, `Knee` y selector `Stepped` (`Soft Clip` / `Tape`) usando en modo `Tape` un modelo ligero calibrado + `ADAA1`<br>**B)** Añadir prueba comparativa offline (estilo `D5`) entre el modo `Tape` ligero y el modelo físico completo de **Jiles-Atherton** (RK4) antes de decidir | ✅ **Opción A** |
+
+---
+
+## 6. Implementación en código (Ola 3)
+
+Los 4 procesadores de dinámica están implementados en `crates/dsp`, prealojados con 4 instancias en `crates/engine` y cubiertos por tests de laboratorio automáticos (`cargo test -p dsp`):
+
+| Pedal | Archivo | Parámetros (`id` / rango / defecto) | Latencia |
+|---|---|---|---|
+| **Noise Gate avanzado** | [`gate.rs`](../../crates/dsp/src/gate.rs) (`kind = "noise_gate"`) | `threshold_db` (`-100..0`, `-60 dB`), `hysteresis_db` (`0..12`, `6 dB`), `hold_ms` (`0..500`, `50 ms`), `release_ms` (`5..1000` log, `100 ms`), `range_db` (`-80..0`, `-80 dB`) | $1\text{ ms}$ fija (`48` m @ `48 kHz`, `192` m @ `192 kHz`) |
+| **Compresor Óptico** | [`opto_comp.rs`](../../crates/dsp/src/opto_comp.rs) (`kind = "opto_comp"`) | `peak_reduction` (`0..100%`, `40%`), `gain_db` (`-6..24`, `4 dB`), `mode` (`Stepped`: `Compress / Limit`), `mix` (`0..100%`, `100%`) | $0$ muestras (*feedback* puro) |
+| **Limitador Brickwall** | [`limiter.rs`](../../crates/dsp/src/limiter.rs) (`kind = "limiter"`) | `drive_db` (`0..24`, `0 dB`), `ceiling_db` (`-12..0`, `-1 dB`), `release_ms` (`10..1000` log, `120 ms`) | $L + T$ (`74` @ `44.1k`, `80` @ `48k`, `152` @ `96k`, `288` @ `192k`) |
+| **Soft Clip / Tape** | [`tape_limiter.rs`](../../crates/dsp/src/tape_limiter.rs) (`kind = "soft_clipper"`) | `drive_db` (`0..24`, `6 dB`), `ceiling_db` (`-12..0`, `-1 dB`), `knee` (`0..100%`, `50%`), `mode` (`Stepped`: `Soft Clip / Tape`) | Mínima de `Oversampler` HIIR + `ADAA1` |
+
+### Decisiones de ingeniería aplicadas
+- **Noise Gate (`gate.rs`):** filtro *sidechain* de 4.º orden `SvfTpt` High-Pass a $120\text{ Hz}$ ($\approx -24.6\text{ dB}$ en $60\text{ Hz}$) más Low-Pass a $4.5\text{ kHz}$; detector de pico ($0.25 / 30\text{ ms}$) con máquina de histéresis y *lookahead* constante de $1\text{ ms}$ incluso con umbral $\le -100\text{ dB}$.
+- **Compresor Óptico (`opto_comp.rs`):** topología *feedback* con detector RMS de $30\text{ ms}$ en `f64`, codo suave Giannoulis (`Compress` $R=3, W=12\text{ dB}$; `Limit` $R=12, W=6\text{ dB}$) con `ModeCrossfader` ($8\text{ ms}$), celda CdS dual-stage ($\tau_{\text{att}} = 10\text{ ms}$, $\tau_{\text{fast}} = 55\text{ ms}$ con peso $55\%$, $\tau_{\text{slow}} = 0.6 + 2.9 H\text{ s}$ con peso $45\%$) e integrador de memoria $H$ ($\tau_{\text{carga}} = 3\text{ s}$, $\tau_{\text{descarga}} = 8\text{ s}$).
+- **Limitador Brickwall (`limiter.rs`):** detector *True-Peak* FIR polifásico de 16 *taps*/fase (sinc-Hann) bajo partición $M(f_s)$ (`4×` $\le 50\text{ kHz}$, `2×` hasta $176.4\text{ kHz}$, `1×` $\ge 176.4\text{ kHz}$, retardo $T=8$ o $0$), mínimo móvil $\mathcal{O}(1)$ por cola monótona circular de ventana $L+1$ ($L \approx 1.5\text{ ms}$) seguido de media móvil *boxcar* de longitud $L+1$, garantizando $g_{\text{smooth}}[j] \le g_{\text{raw}}[j-L]$ y **$0.00\text{ dB}$ de *overshoot*** sin recortes duros.
+- **Soft Clip / Tape (`tape_limiter.rs`):** rama `Soft Clip` $C^2$ continua lineal hasta $C - K$ con asíntota $C$ bajo `ADAA1` y `Oversampler` $M(f_s)$; rama `Tape` con pre-énfasis `MatchedBiquad` High-Shelf ($3\text{ kHz}$, $+2\dots+8\text{ dB}$ según `Knee`), `AsymSoftClipAdaa1` ($C$ vs $0.92 C$), `DcBlocker(10 Hz)` y de-énfasis complementario. Ambas ramas se mezclan mediante `ModeCrossfader` ($6\text{ ms}$). *(Nota: tras `Soft Clip`, la decimación HIIR puede añadir un sobreimpulso de Gibbs moderado sobre señales muy saturadas; cuando se requiera un techo digital estricto de $0.00\text{ dB}$, colocar `BrickwallLimiter` al final de la cadena).*
+
+### Criterios verificados automáticamente en `crates/dsp/src/lib.rs`
+1. **Noise Gate:** eliminación de *chatter* (`1` transición con histéresis de $6\text{ dB}$ frente a $\ge 4$ sin ella), rechazo total de hum a $60\text{ Hz}$ (`< 1e-5`), precisión de `Range = -20 dB` ($\pm 0.5\text{ dB}$) y conservación de transitorio inicial con *lookahead* de $1\text{ ms}$.
+2. **Compresor Óptico:** recuperación dual-stage ($35\text{–}75\%$ en $150\text{ ms}$), cola dependiente de duración ($> +10\%$ residual a $+1\text{ s}$ tras ráfaga de $4\text{ s}$ frente a $0.3\text{ s}$), `THD < 1.5%` en Mi grave ($82.41\text{ Hz}$) y exactitud de `Mix = 0%`.
+3. **Limitador Brickwall:** captura de picos inter-muestra (`fs/4` a $+2.9\text{ dBTP}$, `sample_peak <= 0.75·C` y `true_peak_out <= 1.02·C`), **$0.00\text{ dB}$ *overshoot*** e invarianza de latencia y recuperación en `44.1`, `48`, `96` y `192 kHz`.
+4. **Soft Clip / Tape:** `THD < -80 dB` y error `< 0.05 dB` a `-30 dBFS`, reducción de aliasing `> 20 dB` en `4,370 Hz` frente a recorte duro `1×` (verificado tanto a `44.1 kHz` como a `48 kHz`), respuesta plana en `Tape` a `-40 dBFS`, compresión de agudos a `6 kHz` (`> 1.5 dB` respecto a `200 Hz`) y presencia de $H_2 > -50\text{ dB}$.
+
+### Decisión técnica sobre `SoftClipTape` y medición coherente (`N = 4096`)
+Se mantuvo intacta la arquitectura DSP de `SoftClipTape` (`ParametricSoftClipAdaa1` + `Oversampler` HIIR `4×` para `44.1/48 kHz`), descartando cambios innecesarios al *waveshaper* o al orden de sobremuestreo. Medido sobre una ventana coherente real de $N = 4096$ muestras a `4,370 Hz` (`Drive +18 dB`, `Ceiling -1 dB`, `Knee 50%`), el procesador logra **`81.63 dB` de ASNR** frente a `19.78 dB` del recorte duro `1×` (**`+61.85 dB`** de supresión de aliasing a `48 kHz`, y **`78.70 dB` vs. `19.69 dB` = `+59.01 dB`** a `44.1 kHz`).
+
+La falla inicial observada en laboratorio (`+18.98 dB < 20 dB`) se debió exclusivamente a dos errores de medición que quedaron corregidos:
+1. **Ventana no coherente en el test (`crates/dsp/src/lib.rs`):** generar `generate_coherent_sine(..., WARMUP + N, ...)` (`6144` muestras) y analizar `&[WARMUP..]` (`N = 4096`) dejaba `372.667` ciclos en la ventana FFT, introduciendo fuga espectral. Se corrigió generando el período base coherente sobre `N = 4096` y repitiéndolo cíclicamente hasta `WARMUP + N` (y validando `44.1 kHz` y `48 kHz`).
+2. **Cuantización de fundamental en `compute_harmonic_metrics` (`crates/dsp/src/analyzer.rs`):** `fund_hz` se calculaba como `fund_bin as f32 * bin_hz` ignorando `known_fundamental_hz = Some(f)`, lo que acumulaba error de bin $\times m$ en el rastreo y enmascarado de armónicos altos (`m = 5`). Se corrigió para emplear directamente `known_fundamental_hz` cuando es finito y positivo.

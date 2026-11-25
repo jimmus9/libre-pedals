@@ -6,6 +6,10 @@ use engine::Preset;
 
 pub const FACTORY: &[(&str, &str)] = &[
     ("Clean", include_str!("../presets/clean.json")),
+    (
+        "Clean Comp (Opto + Limiter)",
+        include_str!("../presets/clean_comp.json"),
+    ),
     ("Crunch", include_str!("../presets/crunch.json")),
     ("Lead (Boost + Drive)", include_str!("../presets/lead.json")),
     (

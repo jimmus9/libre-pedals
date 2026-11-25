@@ -20,7 +20,7 @@ jobs:
     name: Format, Clippy & Tests
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -28,11 +28,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Setup ASIO SDK and LLVM
+        uses: ./.github/actions/setup-asio-sdk
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Clippy (ASIO)
+        run: cargo clippy --workspace --all-targets --features pedalera/asio -- -D warnings
 
       - name: Run unit tests
         run: cargo test --workspace
@@ -50,7 +56,7 @@ jobs:
           - variant: asio
             features: "--features asio"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -58,14 +64,13 @@ jobs:
         with:
           key: ${{ matrix.variant }}
 
-      - name: Configure LLVM for ASIO bindgen
+      - name: Setup ASIO SDK and LLVM
         if: matrix.variant == 'asio'
-        shell: pwsh
-        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+        uses: ./.github/actions/setup-asio-sdk
 
       - name: Build release binary
         shell: pwsh
-        run: cargo build --release --locked ${{ matrix.features }}
+        run: cargo build --release --locked -p pedalera ${{ matrix.features }}
 
       - name: Package release archive
         shell: pwsh
@@ -77,7 +82,7 @@ jobs:
           Compress-Archive -Path dist/* -DestinationPath "libre-pedals-${{ matrix.variant }}-windows-x64.zip" -Force
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libre-pedals-${{ matrix.variant }}-windows-x64
           path: libre-pedals-${{ matrix.variant }}-windows-x64.zip
@@ -89,13 +94,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*.zip
           generate_release_notes: true

@@ -924,7 +924,7 @@ impl PedalboardApp {
     fn active_gate_threshold_db(&self) -> Option<f32> {
         for slot in self.params.slots() {
             if slot.kind == "noise_gate" && slot.is_mounted() && !slot.bypass() {
-                let th = slot.get(0);
+                let th = slot.get_by_id("threshold_db").unwrap_or(-100.0);
                 if th > -100.0 {
                     return Some(th);
                 }

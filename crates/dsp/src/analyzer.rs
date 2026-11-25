@@ -231,7 +231,10 @@ pub fn compute_harmonic_metrics(
         return HarmonicMetrics::default();
     }
 
-    let fund_bin = if let Some(f0) = known_fundamental_hz {
+    let valid_known_f0 =
+        known_fundamental_hz.filter(|f| f.is_finite() && *f > 0.0 && *f < 0.48 * sample_rate);
+
+    let fund_bin = if let Some(f0) = valid_known_f0 {
         let approx = ((f0 / bin_hz).round() as usize).clamp(k_min, bins - 1);
         let lo = approx.saturating_sub(2).max(k_min);
         let hi = (approx + 2).min(bins - 1);
@@ -265,7 +268,7 @@ pub fn compute_harmonic_metrics(
         };
     }
 
-    let fund_hz = fund_bin as f32 * bin_hz;
+    let fund_hz = valid_known_f0.unwrap_or(fund_bin as f32 * bin_hz);
     let fund_db = 10.0 * fund_power.log10() as f32;
 
     let mut is_harmonic_bin = vec![false; bins];
@@ -468,4 +471,72 @@ pub fn find_rising_zero_crossing(samples: &[f32], search_len: usize) -> usize {
     }
 
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_harmonic_metrics_invalid_known_fundamental_falls_back_to_auto() {
+        let sr = 48_000.0_f32;
+        let n = 4096usize;
+        let bin_hz = sr / n as f32;
+        let (sine, f_exact) = generate_coherent_sine(4_370.0, sr, n, 0.7);
+
+        let auto = compute_harmonic_metrics(&sine, sr, WindowKind::BlackmanHarris4, None);
+        assert!(
+            auto.fundamental_db > -20.0,
+            "auto fundamental_db unexpectedly low: {}",
+            auto.fundamental_db
+        );
+        assert!(
+            (auto.fundamental_hz - f_exact).abs() < bin_hz,
+            "auto fundamental_hz={} far from expected {f_exact}",
+            auto.fundamental_hz
+        );
+
+        let exact = compute_harmonic_metrics(&sine, sr, WindowKind::BlackmanHarris4, Some(f_exact));
+        assert!(
+            (exact.fundamental_hz - f_exact).abs() < 1e-3,
+            "exact fundamental_hz={} != {f_exact}",
+            exact.fundamental_hz
+        );
+        assert!(exact.fundamental_db > -20.0);
+
+        for invalid_f0 in [
+            f32::NAN,
+            0.0,
+            -440.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            100_000.0,
+        ] {
+            let m =
+                compute_harmonic_metrics(&sine, sr, WindowKind::BlackmanHarris4, Some(invalid_f0));
+            assert!(
+                m.fundamental_db > -20.0,
+                "invalid known_fundamental_hz={invalid_f0} produced floor fundamental_db={}",
+                m.fundamental_db
+            );
+            assert!(
+                (m.fundamental_hz - auto.fundamental_hz).abs() < 1e-4,
+                "invalid known_fundamental_hz={invalid_f0} fundamental_hz={} != auto={}",
+                m.fundamental_hz,
+                auto.fundamental_hz
+            );
+            assert!(
+                (m.fundamental_db - auto.fundamental_db).abs() < 1e-4,
+                "invalid known_fundamental_hz={invalid_f0} fundamental_db={} != auto={}",
+                m.fundamental_db,
+                auto.fundamental_db
+            );
+            assert!(
+                (m.aliasing_snr_db - auto.aliasing_snr_db).abs() < 1e-4,
+                "invalid known_fundamental_hz={invalid_f0} aliasing_snr_db={} != auto={}",
+                m.aliasing_snr_db,
+                auto.aliasing_snr_db
+            );
+        }
+    }
 }
