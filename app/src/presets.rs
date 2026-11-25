@@ -11,6 +11,10 @@ pub const FACTORY: &[(&str, &str)] = &[
         include_str!("../presets/clean_comp.json"),
     ),
     ("Crunch", include_str!("../presets/crunch.json")),
+    (
+        "Funk Auto-Wah + 1x12",
+        include_str!("../presets/funk_wah.json"),
+    ),
     ("Lead (Boost + Drive)", include_str!("../presets/lead.json")),
     (
         "Tube Stack (Boost + 12AX7)",
@@ -33,6 +37,41 @@ pub fn user_presets_dir() -> Result<PathBuf> {
     fs::create_dir_all(&dir)
         .with_context(|| format!("No se pudo crear la carpeta de presets '{}'", dir.display()))?;
     Ok(dir)
+}
+
+pub fn user_irs_dir() -> Result<PathBuf> {
+    let dir = app_data_dir().join("irs");
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("No se pudo crear la carpeta de IRs '{}'", dir.display()))?;
+    Ok(dir)
+}
+
+pub fn list_user_irs() -> Vec<(String, PathBuf)> {
+    let Ok(dir) = user_irs_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+        {
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("IR")
+                .to_string();
+            out.push((name, path));
+        }
+    }
+    out.sort_by_key(|a| a.0.to_lowercase());
+    out
 }
 
 pub fn sanitize_filename(name: &str) -> String {

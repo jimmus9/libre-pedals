@@ -17,8 +17,8 @@ use engine::{
 use crate::{
     analyzer_ui::AnalyzerState,
     presets::{
-        delete_user_preset, list_user_presets, load_factory_preset, resolve_preset,
-        save_user_preset, user_presets_dir, FACTORY,
+        delete_user_preset, list_user_irs, list_user_presets, load_factory_preset, resolve_preset,
+        save_user_preset, user_irs_dir, user_presets_dir, FACTORY,
     },
     settings::{host_from_str, host_to_string, PresetRef, Settings},
 };
@@ -104,6 +104,15 @@ struct PedalboardApp {
     confirm_overwrite: Option<String>,
     confirm_delete: Option<(String, PathBuf)>,
     pending_switch: Option<PresetRef>,
+    ir_browser: Option<IrBrowserState>,
+}
+
+struct IrBrowserState {
+    slot_idx: usize,
+    pedal_title: String,
+    current_dir: PathBuf,
+    manual_path: String,
+    error: Option<String>,
 }
 
 impl PedalboardApp {
@@ -172,6 +181,8 @@ impl PedalboardApp {
                 output_peak: 0.0,
                 input_db: -120.0,
                 output_db: -120.0,
+                dsp_latency_samples: 0,
+                dsp_cpu_percent: 0.0,
                 underruns: 0,
                 overflows: 0,
                 drift_drops: 0,
@@ -191,6 +202,7 @@ impl PedalboardApp {
             confirm_overwrite: None,
             confirm_delete: None,
             pending_switch: None,
+            ir_browser: None,
         };
 
         app.select_defaults_if_missing();
@@ -1238,18 +1250,35 @@ impl PedalboardApp {
                 let out_b = info
                     .output_buffer_frames
                     .map_or("?".to_string(), |v| v.to_string());
+                let stack_samples = self.last_snapshot.dsp_latency_samples as usize;
+                let stack_ms =
+                    stack_samples as f32 * 1_000.0 / info.processing_sample_rate.max(1) as f32;
+                let total_ms = info.estimated_latency_ms + stack_ms;
+                let cpu_pct = self.last_snapshot.dsp_cpu_percent;
                 ui.label(
                     egui::RichText::new(format!(
-                        "Latencia: {:.1} ms  ·  Buf: {in_b}/{out_b}  ·  xruns: {xruns}",
+                        "Latencia: {total_ms:.1} ms ({:.1} + Stack {stack_ms:.2}) · DSP: {cpu_pct:.1}% · Buf: {in_b}/{out_b} · xruns: {xruns}",
                         info.estimated_latency_ms,
                     ))
                     .size(11.5)
                     .color(Color32::from_rgb(148, 163, 184)),
-                );
+                )
+                .on_hover_text(format!(
+                    "Driver/Ring: {:.2} ms\nStack DSP activo: {stack_samples} muestras ({stack_ms:.2} ms @ {} Hz)\n\
+                     • Noise Gate: +1.00 ms por instancia activa\n\
+                     • Brickwall Limiter: +1.50 ms (+FIR True-Peak) por instancia activa\n\
+                     • Parametric EQ, Wah y Cabinet IR (UPOLS): +0.00 ms",
+                    info.estimated_latency_ms, info.processing_sample_rate
+                ));
             } else {
+                let est_sr = self.selected_proc_rate.or_else(|| self.selected_input_native_rate()).unwrap_or(48_000);
+                let stack_samples = engine::estimate_chain_latency_samples(&self.params, est_sr);
+                let stack_ms = stack_samples as f32 * 1_000.0 / est_sr.max(1) as f32;
                 ui.colored_label(
                     Color32::from_rgb(148, 163, 184),
-                    "Selecciona dispositivos y presiona Iniciar.",
+                    format!(
+                        "Stack DSP: {stack_ms:.2} ms ({stack_samples} muestras @ {est_sr} Hz) · Presiona Iniciar."
+                    ),
                 );
             }
         });
@@ -1558,8 +1587,9 @@ impl PedalboardApp {
                     .max()
                     .unwrap_or(1);
                 let max_knob_rows = max_knobs.div_ceil(3).max(1);
-                let pedal_height = 152.0 + max_knob_rows as f32 * 94.0;
+                let pedal_height = 178.0 + max_knob_rows as f32 * 94.0;
                 let pedal_width = 250.0;
+                let mut open_ir_browser: Option<(usize, String)> = None;
 
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
@@ -1630,11 +1660,13 @@ impl PedalboardApp {
                                             &self.params,
                                             m_idx,
                                             cascade_pos,
+                                            slot_idx,
                                             prev_pos,
                                             next_pos,
                                             slot,
                                             pedal_width,
                                             pedal_height,
+                                            &mut open_ir_browser,
                                         );
                                     }
                                     draw_signal_arrow(ui, pedal_height, active && !muted);
@@ -1663,17 +1695,275 @@ impl PedalboardApp {
                         ui.add_space(12.0);
                         self.analyzer.draw(ui, active_proc_sr, &self.params);
                     });
+
+                if let Some((slot_idx, pedal_title)) = open_ir_browser {
+                    let start_dir = self
+                        .params
+                        .slots()
+                        .get(slot_idx)
+                        .and_then(|s| s.custom_ir_info())
+                        .and_then(|(_, p)| PathBuf::from(p).parent().map(|d| d.to_path_buf()))
+                        .or_else(|| user_irs_dir().ok())
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let manual_path = self
+                        .params
+                        .slots()
+                        .get(slot_idx)
+                        .and_then(|s| s.custom_ir_info())
+                        .map(|(_, p)| p)
+                        .unwrap_or_default();
+                    self.ir_browser = Some(IrBrowserState {
+                        slot_idx,
+                        pedal_title,
+                        current_dir: start_dir,
+                        manual_path,
+                        error: None,
+                    });
+                }
             });
+    }
+
+    fn load_ir_into_slot(&mut self, slot_idx: usize, path: &std::path::Path) -> Result<(), String> {
+        let Some(slot) = self.params.slots().get(slot_idx) else {
+            return Err("Instancia de gabinete no encontrada.".to_string());
+        };
+        let name = slot.load_custom_ir_from_path(path)?;
+        slot.set_by_id("model", 3.0);
+        self.preset_status = Some(format!("IR cargada en {}: {name}", slot.display_name()));
+        Ok(())
+    }
+
+    fn handle_dropped_wavs(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| {
+                    let p = f.path();
+                    if p.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(p.to_path_buf())
+                    }
+                })
+                .filter(|p| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+                })
+                .collect()
+        });
+        let Some(path) = dropped.into_iter().next() else {
+            return;
+        };
+
+        let target_slot = self.ir_browser.as_ref().map(|b| b.slot_idx).or_else(|| {
+            self.params
+                .mounted_cascade()
+                .into_iter()
+                .find(|&idx| self.params.slots()[idx].kind == "cabinet_ir")
+        });
+
+        let Some(slot_idx) = target_slot else {
+            self.preset_status = Some(format!(
+                "Monta un pedal Cabinet IR para cargar '{}'.",
+                path.display()
+            ));
+            return;
+        };
+
+        match self.load_ir_into_slot(slot_idx, &path) {
+            Ok(()) => {
+                if let Some(ref mut browser) = self.ir_browser {
+                    browser.error = None;
+                    browser.manual_path = path.to_string_lossy().to_string();
+                }
+            }
+            Err(err) => {
+                if let Some(ref mut browser) = self.ir_browser {
+                    browser.error = Some(err);
+                } else {
+                    self.preset_status = Some(err);
+                }
+            }
+        }
+    }
+
+    fn draw_ir_browser_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(mut browser) = self.ir_browser.take() else {
+            return;
+        };
+        let mut keep_open = true;
+        let mut chosen_path: Option<PathBuf> = None;
+
+        egui::Window::new(format!("Seleccionar IR (.wav) — {}", browser.pedal_title))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "También puedes arrastrar y soltar un archivo .wav sobre la ventana.",
+                    )
+                    .size(11.5)
+                    .color(Color32::from_rgb(148, 163, 184)),
+                );
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Ruta .wav:");
+                    let te = ui.add(
+                        egui::TextEdit::singleline(&mut browser.manual_path).desired_width(300.0),
+                    );
+                    if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        chosen_path = Some(PathBuf::from(browser.manual_path.trim()));
+                    }
+                    if ui.button("Cargar").clicked() {
+                        chosen_path = Some(PathBuf::from(browser.manual_path.trim()));
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("⬆ Subir").clicked() {
+                        if let Some(parent) = browser.current_dir.parent() {
+                            browser.current_dir = parent.to_path_buf();
+                        }
+                    }
+                    if ui.button("📂 Carpeta IRs").clicked() {
+                        if let Ok(dir) = user_irs_dir() {
+                            browser.current_dir = dir;
+                        }
+                    }
+                    if ui.button("Abrir en Explorer").clicked() {
+                        let _ = std::process::Command::new("explorer")
+                            .arg(&browser.current_dir)
+                            .spawn();
+                    }
+                });
+
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Carpeta actual: {}",
+                        browser.current_dir.display()
+                    ))
+                    .size(11.0)
+                    .color(Color32::from_rgb(148, 163, 184)),
+                );
+                ui.separator();
+
+                let user_irs = list_user_irs();
+                if !user_irs.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Biblioteca IRs de usuario:")
+                            .strong()
+                            .size(12.0),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, path) in &user_irs {
+                            if ui.button(format!("🎵 {name}.wav")).clicked() {
+                                chosen_path = Some(path.clone());
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
+
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        let Ok(entries) = std::fs::read_dir(&browser.current_dir) else {
+                            ui.colored_label(
+                                Color32::from_rgb(248, 113, 113),
+                                "No se pudo leer esta carpeta.",
+                            );
+                            return;
+                        };
+                        let mut dirs = Vec::new();
+                        let mut wavs = Vec::new();
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_dir() {
+                                dirs.push(p);
+                            } else if p.is_file()
+                                && p.extension()
+                                    .and_then(|e| e.to_str())
+                                    .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+                            {
+                                wavs.push(p);
+                            }
+                        }
+                        dirs.sort();
+                        wavs.sort();
+
+                        for d in dirs {
+                            let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("carpeta");
+                            if ui.selectable_label(false, format!("📁 {name}")).clicked() {
+                                browser.current_dir = d;
+                                break;
+                            }
+                        }
+                        for w in wavs {
+                            let name = w
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("archivo.wav");
+                            if ui.selectable_label(false, format!("🔊 {name}")).clicked() {
+                                chosen_path = Some(w);
+                                break;
+                            }
+                        }
+                    });
+
+                if let Some(ref err) = browser.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(Color32::from_rgb(248, 113, 113), format!("⚠ {err}"));
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if let Some(slot) = self.params.slots().get(browser.slot_idx) {
+                        if slot.custom_ir_info().is_some()
+                            && ui.button("Quitar WAV personalizado").clicked()
+                        {
+                            slot.set_custom_ir(None);
+                            slot.set_by_id("model", 1.0);
+                            keep_open = false;
+                        }
+                    }
+                    if ui.button("Cerrar").clicked() {
+                        keep_open = false;
+                    }
+                });
+            });
+
+        if let Some(path) = chosen_path {
+            match self.load_ir_into_slot(browser.slot_idx, &path) {
+                Ok(()) => {
+                    keep_open = false;
+                }
+                Err(err) => {
+                    browser.error = Some(err);
+                }
+            }
+        }
+
+        if keep_open {
+            self.ir_browser = Some(browser);
+        }
     }
 }
 
 impl eframe::App for PedalboardApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.handle_dropped_wavs(ui.ctx());
         self.update_meters(ui.ctx());
         self.draw_preset_bar(ui);
         self.draw_studio_rack(ui);
         self.draw_cascade_board(ui);
         self.draw_preset_dialogs(ui);
+        self.draw_ir_browser_dialog(ui);
         ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
 }
@@ -1884,11 +2174,13 @@ fn draw_stompbox_pedal(
     params: &Params,
     mounted_idx: usize,
     cascade_pos: usize,
+    slot_idx: usize,
     prev_pos: Option<usize>,
     next_pos: Option<usize>,
     slot: &PedalParamSlot,
     pedal_width: f32,
     pedal_height: f32,
+    open_ir_browser: &mut Option<(usize, String)>,
 ) {
     let [r, g, b] = slot.accent_color;
     let accent = Color32::from_rgb(r, g, b);
@@ -2020,7 +2312,8 @@ fn draw_stompbox_pedal(
             let row_count = knob_count.div_ceil(3).max(1);
             let row_gap = 4.0;
             let knobs_total_h = row_count as f32 * (knob_h + row_gap);
-            let footer_reserve = 72.0;
+            let is_cab = slot.kind == "cabinet_ir";
+            let footer_reserve = if is_cab { 102.0 } else { 72.0 };
             let content_h = (pedal_height - 20.0 - 50.0).max(150.0);
             let top_pad = ((content_h - knobs_total_h - footer_reserve) * 0.4).max(4.0);
 
@@ -2052,8 +2345,39 @@ fn draw_stompbox_pedal(
             let bottom_pad = (content_h - top_pad - knobs_total_h - footer_reserve).max(4.0);
             ui.add_space(bottom_pad);
 
-            // Zona inferior compacta: Footswitch + Reset alineados
+            // Zona inferior compacta: selector de IR (solo Cabinet IR) + Footswitch + Reset
             ui.vertical_centered(|ui| {
+                if is_cab {
+                    let custom_info = slot.custom_ir_info();
+                    ui.horizontal(|ui| {
+                        let ir_label = custom_info
+                            .as_ref()
+                            .map(|(n, _)| truncate_label(&format!("WAV: {n}"), 18))
+                            .unwrap_or_else(|| "IR integrada".to_string());
+                        if ui
+                            .add(
+                                egui::Button::new(format!("📂 {ir_label}"))
+                                    .min_size(Vec2::new(138.0, 22.0)),
+                            )
+                            .on_hover_text(
+                                "Cargar archivo .wav de gabinete (o arrastra un .wav a la ventana)",
+                            )
+                            .clicked()
+                        {
+                            *open_ir_browser = Some((slot_idx, slot.display_name()));
+                        }
+                        if custom_info.is_some()
+                            && ui
+                                .add(egui::Button::new("✕").min_size(Vec2::new(24.0, 22.0)))
+                                .on_hover_text("Quitar WAV personalizado")
+                                .clicked()
+                        {
+                            slot.set_custom_ir(None);
+                            slot.set_by_id("model", 1.0);
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
                 let switch_text = if active { "● ACTIVO" } else { "○ BYPASS" };
                 let switch_fill = if active {
                     Color32::from_rgb(r / 2 + 25, g / 2 + 25, b / 2 + 25)

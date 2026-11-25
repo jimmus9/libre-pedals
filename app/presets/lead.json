@@ -2,7 +2,7 @@
   "format_version": 1,
   "name": "Lead (Boost + Drive)",
   "author": "libre-pedals",
-  "description": "Klon transparente empujando a overdrive enfocado en medios estilo TS-808",
+  "description": "Klon transparente empujando a overdrive TS-808, EQ Paramétrico post-drive y gabinete 4x12 High-Gain",
   "chain": [
     {
       "id": "noise_gate-1",
@@ -36,8 +36,39 @@
         "low_cut_hz": 720.0,
         "asymmetry": 55.0,
         "clean_blend": 0.0,
-        "tone_hz": 4200.0,
-        "level_db": -14.0
+        "tone_hz": 5200.0,
+        "level_db": -12.0
+      }
+    },
+    {
+      "id": "parametric_eq-1",
+      "pedal": "parametric_eq",
+      "label": "Solo Mid Push",
+      "enabled": true,
+      "params": {
+        "low_freq_hz": 95.0,
+        "low_gain_db": 1.5,
+        "lm_freq_hz": 420.0,
+        "lm_gain_db": -2.0,
+        "lm_q": 1.2,
+        "hm_freq_hz": 1650.0,
+        "hm_gain_db": 3.5,
+        "hm_q": 1.4,
+        "high_freq_hz": 4800.0,
+        "high_gain_db": 1.0,
+        "level_db": 0.0
+      }
+    },
+    {
+      "id": "cabinet_ir-1",
+      "pedal": "cabinet_ir",
+      "enabled": true,
+      "params": {
+        "model": 2.0,
+        "low_cut_hz": 90.0,
+        "high_cut_hz": 7800.0,
+        "mix": 100.0,
+        "level_db": 0.0
       }
     }
   ],

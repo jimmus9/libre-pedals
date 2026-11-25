@@ -1,0 +1,72 @@
+{
+  "format_version": 1,
+  "name": "Funk Auto-Wah + 1x12",
+  "author": "libre-pedals",
+  "description": "Compresión óptica controlada, CryBaby Auto-Wah sensible al ataque, EQ paramétrico y combo 1x12 Clean",
+  "chain": [
+    {
+      "id": "noise_gate-1",
+      "pedal": "noise_gate",
+      "enabled": true,
+      "params": {
+        "threshold_db": -62.0
+      }
+    },
+    {
+      "id": "opto_comp-1",
+      "pedal": "opto_comp",
+      "enabled": true,
+      "params": {
+        "peak_reduction": 42.0,
+        "gain_db": 3.0,
+        "mode": 0.0,
+        "mix": 85.0
+      }
+    },
+    {
+      "id": "wah-1",
+      "pedal": "wah",
+      "label": "CryBaby Auto",
+      "enabled": true,
+      "params": {
+        "mode": 1.0,
+        "position": 28.0,
+        "sensitivity": 72.0,
+        "resonance": 58.0,
+        "release_ms": 140.0,
+        "mix": 100.0
+      }
+    },
+    {
+      "id": "parametric_eq-1",
+      "pedal": "parametric_eq",
+      "enabled": true,
+      "params": {
+        "low_freq_hz": 90.0,
+        "low_gain_db": 2.0,
+        "lm_freq_hz": 380.0,
+        "lm_gain_db": -2.5,
+        "lm_q": 1.1,
+        "hm_freq_hz": 2400.0,
+        "hm_gain_db": 2.5,
+        "hm_q": 1.0,
+        "high_freq_hz": 5500.0,
+        "high_gain_db": 1.5,
+        "level_db": 0.0
+      }
+    },
+    {
+      "id": "cabinet_ir-1",
+      "pedal": "cabinet_ir",
+      "enabled": true,
+      "params": {
+        "model": 0.0,
+        "low_cut_hz": 65.0,
+        "high_cut_hz": 9200.0,
+        "mix": 100.0,
+        "level_db": 0.0
+      }
+    }
+  ],
+  "preset_level_db": 0.0
+}

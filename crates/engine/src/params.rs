@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use dsp::{lin_to_db, Chain, ParamSpec};
+use dsp::{lin_to_db, Chain, CustomIrAsset, ParamSpec};
 
 pub const MAX_INSTANCES_PER_KIND: usize = 4;
 pub const MAX_MOUNTED_PEDALS: usize = 12;
@@ -144,6 +145,8 @@ pub struct PedalParamSlot {
     bypass: AtomicBool,
     mounted: AtomicBool,
     label: Mutex<String>,
+    ir_version: AtomicU64,
+    custom_ir: Mutex<Option<Arc<CustomIrAsset>>>,
 }
 
 impl PedalParamSlot {
@@ -222,6 +225,37 @@ impl PedalParamSlot {
             format!("{} ({})", self.name, self.instance)
         }
     }
+
+    #[inline]
+    pub fn custom_ir_version(&self) -> u64 {
+        self.ir_version.load(Ordering::Acquire)
+    }
+
+    pub fn set_custom_ir(&self, asset: Option<Arc<CustomIrAsset>>) {
+        let mut guard = self.custom_ir.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = asset;
+        self.ir_version.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn load_custom_ir_from_path(&self, path: &Path) -> Result<String, String> {
+        let asset = Arc::new(CustomIrAsset::load_from_path(path)?);
+        let name = asset.name.clone();
+        self.set_custom_ir(Some(asset));
+        Ok(name)
+    }
+
+    pub fn custom_ir_info(&self) -> Option<(String, String)> {
+        let guard = self.custom_ir.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|a| (a.name.clone(), a.path.clone()))
+    }
+
+    pub(crate) fn try_with_custom_ir<R>(
+        &self,
+        f: impl FnOnce(Option<&Arc<CustomIrAsset>>) -> R,
+    ) -> Option<R> {
+        let guard = self.custom_ir.try_lock().ok()?;
+        Some(f(guard.as_ref()))
+    }
 }
 
 /// Parámetros compartidos entre la UI/CLI y el callback de audio mediante atómicos.
@@ -274,6 +308,8 @@ impl Params {
                             && matches!(kind, "noise_gate" | "overdrive" | "master_volume"),
                     ),
                     label: Mutex::new(String::new()),
+                    ir_version: AtomicU64::new(0),
+                    custom_ir: Mutex::new(None),
                 });
                 order.push(AtomicUsize::new(idx));
             }
@@ -404,6 +440,7 @@ impl Params {
         slot.reset_defaults();
         slot.set_bypass(false);
         slot.set_label("");
+        slot.set_custom_ir(None);
         self.move_slot_to_end(idx);
         Some(idx)
     }
@@ -645,11 +682,13 @@ impl Params {
     }
 }
 
-/// Medidores en tiempo real (picos de entrada/salida y contadores de cortes).
+/// Medidores en tiempo real (picos de entrada/salida, telemetría DSP y contadores de cortes).
 #[derive(Debug)]
 pub struct Meters {
     pub(crate) input_peak: AtomicF32,
     pub(crate) output_peak: AtomicF32,
+    pub(crate) dsp_latency_samples: AtomicU32,
+    pub(crate) dsp_cpu_percent: AtomicF32,
     pub(crate) underruns: AtomicU64,
     pub(crate) overflows: AtomicU64,
     pub(crate) drift_drops: AtomicU64,
@@ -668,6 +707,8 @@ pub struct MeterSnapshot {
     pub output_peak: f32,
     pub input_db: f32,
     pub output_db: f32,
+    pub dsp_latency_samples: u32,
+    pub dsp_cpu_percent: f32,
     pub underruns: u64,
     pub overflows: u64,
     pub drift_drops: u64,
@@ -679,6 +720,8 @@ impl Meters {
         Self {
             input_peak: AtomicF32::new(0.0),
             output_peak: AtomicF32::new(0.0),
+            dsp_latency_samples: AtomicU32::new(0),
+            dsp_cpu_percent: AtomicF32::new(0.0),
             underruns: AtomicU64::new(0),
             overflows: AtomicU64::new(0),
             drift_drops: AtomicU64::new(0),
@@ -695,6 +738,8 @@ impl Meters {
             output_peak,
             input_db: lin_to_db(input_peak),
             output_db: lin_to_db(output_peak),
+            dsp_latency_samples: self.dsp_latency_samples.load(Ordering::Relaxed),
+            dsp_cpu_percent: self.dsp_cpu_percent.load(),
             underruns: self.underruns.load(Ordering::Relaxed),
             overflows: self.overflows.load(Ordering::Relaxed),
             drift_drops: self.drift_drops.load(Ordering::Relaxed),
@@ -710,13 +755,16 @@ mod tests {
     #[test]
     fn params_mounting_and_master_separation_keep_master_last() {
         let params = Params::default();
-        assert_eq!(params.slot_count(), 7 * MAX_INSTANCES_PER_KIND + 1);
+        assert_eq!(params.slot_count(), 10 * MAX_INSTANCES_PER_KIND + 1);
         let kinds: Vec<&str> = params.kinds().into_iter().map(|k| k.kind).collect();
         assert!(kinds.contains(&"noise_gate"));
+        assert!(kinds.contains(&"wah"));
         assert!(kinds.contains(&"clean_boost"));
         assert!(kinds.contains(&"opto_comp"));
         assert!(kinds.contains(&"overdrive"));
         assert!(kinds.contains(&"tube_preamp"));
+        assert!(kinds.contains(&"parametric_eq"));
+        assert!(kinds.contains(&"cabinet_ir"));
         assert!(kinds.contains(&"soft_clipper"));
         assert!(kinds.contains(&"limiter"));
         let master = params.master_slot().expect("master slot");

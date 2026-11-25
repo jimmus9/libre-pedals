@@ -2,6 +2,7 @@ use std::any::Any;
 
 pub mod adaa;
 pub mod analyzer;
+pub mod cabinet_ir;
 pub mod clean_boost;
 pub mod d5_experiment;
 pub mod denormals;
@@ -12,11 +13,14 @@ pub mod matched_eq;
 pub mod opto_comp;
 pub mod overdrive;
 pub mod oversampler;
+pub mod parametric_eq;
 pub mod resampler;
 pub mod smoother;
 pub mod svf;
 pub mod tape_limiter;
 pub mod tube_preamp;
+pub mod wah;
+pub mod wav;
 
 pub use adaa::{AsymSoftClipAdaa1, HalfSampleDelay, TanhAdaa1};
 pub use analyzer::{
@@ -24,6 +28,9 @@ pub use analyzer::{
     compute_spectrum_db_with_window, compute_waveform_metrics, fft_in_place,
     find_rising_zero_crossing, generate_coherent_sine, HarmonicMetrics, WaveformMetrics,
     WindowKind,
+};
+pub use cabinet_ir::{
+    partition_size_for_rate, CabinetIr, CustomIrAsset, PreparedIrPartitions, UpolsConvolver,
 };
 pub use clean_boost::CleanBoost;
 pub use denormals::{flush_denormal, flush_denormal_f64, ScopedNoDenormals};
@@ -34,11 +41,14 @@ pub use matched_eq::{MatchedBiquad, MatchedFilterKind};
 pub use opto_comp::OptoCompressor;
 pub use overdrive::Overdrive;
 pub use oversampler::{adaptive_oversampling_factor, HalfBandStage2x, Oversampler};
+pub use parametric_eq::ParametricEq;
 pub use resampler::Resampler;
 pub use smoother::{ModeCrossfader, OnePoleSmoother};
 pub use svf::{SvfMode, SvfTpt};
 pub use tape_limiter::SoftClipTape;
 pub use tube_preamp::TubePreamp;
+pub use wah::Wah;
+pub use wav::WavIrData;
 
 /// Conversión de decibelios a ganancia lineal. Valores <= -120 dB se tratan como silencio.
 #[inline]
@@ -227,6 +237,10 @@ pub trait Effect: Send + AsAny {
     fn prepare(&mut self, sample_rate: f32, max_block: usize);
     fn process(&mut self, buf: &mut [f32]);
     fn reset(&mut self) {}
+    /// Latencia algorítmica añadida por el efecto en muestras a la frecuencia actual de `prepare()`.
+    fn latency_samples(&self) -> usize {
+        0
+    }
 }
 
 /// Filtro pasa-altos de primer orden (bloqueador de componente DC).
@@ -402,6 +416,15 @@ impl Effect for Chain {
         for (fx, _) in &mut self.slots {
             fx.reset();
         }
+    }
+
+    fn latency_samples(&self) -> usize {
+        self.order
+            .iter()
+            .filter_map(|&idx| self.slots.get(idx))
+            .filter(|(_, bypass)| !*bypass)
+            .map(|(fx, _)| fx.latency_samples())
+            .sum()
     }
 }
 
@@ -1909,5 +1932,389 @@ mod tests {
             "Tape should generate even harmonic H2 > -50 dB: {}",
             hm_tape.h2_db
         );
+    }
+
+    #[test]
+    fn parametric_eq_matched_response_no_nyquist_cramping() {
+        let mut eq = ParametricEq::new();
+        assert_eq!(eq.latency_samples(), 0);
+
+        // Verifica precisión de ganancia, simetría boost/cut y ausencia de aplastamiento cerca de Nyquist.
+        let measure_sine_gain_db = |fx: &mut ParametricEq, sr: f32, freq_hz: f32| -> (f32, f32) {
+            fx.reset();
+            let warmup = (0.08 * sr) as usize;
+            let n = if sr >= 96_000.0 { 8192usize } else { 4096usize };
+            let (base, f_exact) = generate_coherent_sine(freq_hz, sr, n, 0.2);
+            let s_in: Vec<f32> = base.iter().copied().cycle().take(warmup + n).collect();
+            let mut s_out = s_in.clone();
+            for ch in s_out.chunks_mut(256) {
+                fx.process(ch);
+            }
+            let in_db = compute_waveform_metrics(&s_in[warmup..]).rms_db;
+            let out_db = compute_waveform_metrics(&s_out[warmup..]).rms_db;
+            (out_db - in_db, f_exact)
+        };
+
+        for &sr in &[44_100.0_f32, 48_000.0, 96_000.0, 192_000.0] {
+            // 1) Low Shelf 100 Hz +/- 12 dB -> en esquina f0 = +6 dB; en grave profundo ~ +12 dB.
+            eq.set_low_band(100.0, 12.0);
+            eq.set_low_mid_band(650.0, 0.0, 1.5);
+            eq.set_high_mid_band(8_000.0, 0.0, 1.5);
+            eq.set_high_band(10_000.0, 0.0);
+            eq.set_level_db(0.0);
+            eq.prepare(sr, 256);
+
+            let (ls_corner, f_ls) = measure_sine_gain_db(&mut eq, sr, 100.0);
+            let ls_expected = eq.magnitude_db_at(f_ls);
+            let ls_nominal = eq.magnitude_db_at(100.0);
+            assert!(
+                (ls_nominal - 6.0).abs() < 0.15 && (ls_corner - ls_expected).abs() < 0.25,
+                "LowShelf corner gain at {sr} Hz (f={f_ls:.1}): nom100={ls_nominal:.2}, meas={ls_corner:.2}, exp={ls_expected:.2} dB"
+            );
+
+            // 2) Bandas Bell 650 Hz (+12 / -12 dB) y 8 kHz (+12 dB) + simetría boost/cut.
+            eq.set_low_band(100.0, 0.0);
+            eq.set_low_mid_band(650.0, 12.0, 2.0);
+            eq.prepare(sr, 256);
+            let (bell_650_boost, f_650) = measure_sine_gain_db(&mut eq, sr, 650.0);
+            let exp_650 = eq.magnitude_db_at(f_650);
+            let nom_650 = eq.magnitude_db_at(650.0);
+            assert!(
+                (nom_650 - 12.0).abs() < 0.15 && (bell_650_boost - exp_650).abs() < 0.25,
+                "LM Bell 650 Hz boost at {sr} Hz: nom={nom_650:.2}, meas={bell_650_boost:.2}, exp={exp_650:.2} dB"
+            );
+
+            eq.set_low_mid_band(650.0, -12.0, 2.0);
+            eq.prepare(sr, 256);
+            let (bell_650_cut, _) = measure_sine_gain_db(&mut eq, sr, 650.0);
+            assert!(
+                (bell_650_boost + bell_650_cut).abs() < 0.1,
+                "Bell boost/cut asymmetry at {sr} Hz: +{bell_650_boost:.2} vs {bell_650_cut:.2}"
+            );
+
+            // 3) HM Bell a 8 kHz (cerca de Nyquist en 44.1k): ganancia exacta y forma preservada.
+            eq.set_low_mid_band(650.0, 0.0, 1.5);
+            eq.set_high_mid_band(8_000.0, 12.0, 1.5);
+            eq.prepare(sr, 256);
+            let (bell_8k, f_8k) = measure_sine_gain_db(&mut eq, sr, 8_000.0);
+            let exp_8k = eq.magnitude_db_at(f_8k);
+            let nom_8k = eq.magnitude_db_at(8_000.0);
+            assert!(
+                (nom_8k - 12.0).abs() < 0.15 && (bell_8k - exp_8k).abs() < 0.25,
+                "HM Bell 8 kHz gain at {sr} Hz: nom={nom_8k:.2}, meas={bell_8k:.2}, exp={exp_8k:.2} dB"
+            );
+
+            // 4) High Shelf 10 kHz +12 dB: mitad en 10 kHz (~+6 dB) incluso a 44.1 kHz.
+            eq.set_high_mid_band(2_200.0, 0.0, 1.2);
+            eq.set_high_band(10_000.0, 12.0);
+            eq.prepare(sr, 256);
+            let (hs_10k, f_hs) = measure_sine_gain_db(&mut eq, sr, 10_000.0);
+            let exp_hs = eq.magnitude_db_at(f_hs);
+            let nom_hs = eq.magnitude_db_at(10_000.0);
+            assert!(
+                (nom_hs - 6.0).abs() < 0.15 && (hs_10k - exp_hs).abs() < 0.25,
+                "HighShelf 10 kHz corner at {sr} Hz: nom={nom_hs:.2}, meas={hs_10k:.2}, exp={exp_hs:.2} dB"
+            );
+        }
+
+        // Compara ancho de campana a 8 kHz (en 11.5 kHz) entre 44.1 kHz y 192 kHz -> sin cramping.
+        let mut eq_44 = ParametricEq::new();
+        eq_44.set_high_mid_band(8_000.0, 12.0, 1.5);
+        eq_44.prepare(44_100.0, 256);
+        let mut eq_192 = ParametricEq::new();
+        eq_192.set_high_mid_band(8_000.0, 12.0, 1.5);
+        eq_192.prepare(192_000.0, 256);
+        let skirt_diff = (eq_44.magnitude_db_at(11_500.0) - eq_192.magnitude_db_at(11_500.0)).abs();
+        assert!(
+            skirt_diff < 0.6,
+            "Nyquist cramping detected between 44.1k and 192k at 11.5 kHz: diff={skirt_diff:.2} dB"
+        );
+    }
+
+    #[test]
+    fn wah_crybaby_coupled_q_and_auto_envelope_modes() {
+        let sr = 48_000.0_f32;
+        let mut wah = Wah::new();
+        assert_eq!(wah.latency_samples(), 0);
+        wah.set_mode(0.0); // Manual
+        wah.set_resonance(70.0);
+        wah.set_mix(100.0);
+
+        let find_peak_hz = |w: &mut Wah| -> (f32, f32) {
+            w.reset();
+            let n = 4096usize;
+            let mut imp = vec![0.0_f32; n];
+            imp[0] = 1.0;
+            for ch in imp.chunks_mut(128) {
+                w.process(ch);
+            }
+            let mut spec = vec![-120.0_f32; n / 2];
+            compute_spectrum_db_with_window(&imp, &mut spec, WindowKind::Hann);
+            // FFT directa sobre impulso sin enventanado alteraría inicio; usamos ruido blanco/multitono si no,
+            // aquí usamos compute_spectrum_db sobre una respuesta desplazada en n=512!
+            w.reset();
+            let mut imp_mid = vec![0.0_f32; n];
+            imp_mid[512] = 0.5;
+            for ch in imp_mid.chunks_mut(128) {
+                w.process(ch);
+            }
+            compute_spectrum_db(&imp_mid, &mut spec);
+            let bin_hz = sr / n as f32;
+            let k_min = (250.0 / bin_hz).ceil() as usize;
+            let k_max = (4_000.0 / bin_hz).floor() as usize;
+            let (peak_k, &peak_db) = spec[k_min..=k_max]
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap();
+            let abs_k = k_min + peak_k;
+            // Mide ancho de banda relativo -6 dB alrededor del pico para verificar aumento de Q.
+            let thresh = peak_db - 6.0;
+            let mut lo_k = abs_k;
+            while lo_k > k_min && spec[lo_k] > thresh {
+                lo_k -= 1;
+            }
+            let mut hi_k = abs_k;
+            while hi_k < k_max && spec[hi_k] > thresh {
+                hi_k += 1;
+            }
+            let f_peak = abs_k as f32 * bin_hz;
+            let bw_rel = ((hi_k - lo_k).max(1) as f32 * bin_hz) / f_peak.max(1.0);
+            (f_peak, bw_rel)
+        };
+
+        wah.set_position(0.0);
+        wah.prepare(sr, 128);
+        let (f_heel, bw_heel) = find_peak_hz(&mut wah);
+
+        wah.set_position(100.0);
+        wah.prepare(sr, 128);
+        let (f_toe, bw_toe) = find_peak_hz(&mut wah);
+
+        assert!(
+            (300.0..=440.0).contains(&f_heel),
+            "Heel peak frequency out of CryBaby range: {f_heel} Hz"
+        );
+        assert!(
+            (1_900.0..=2_450.0).contains(&f_toe),
+            "Toe peak frequency out of CryBaby range: {f_toe} Hz"
+        );
+        assert!(
+            bw_toe < bw_heel,
+            "Coupled Q should narrow relative bandwidth toward toe: bw_heel={bw_heel:.3}, bw_toe={bw_toe:.3}"
+        );
+
+        // Auto Up vs Auto Down con señal armónica rica (220 Hz + 880 Hz + 1900 Hz).
+        let make_chord = |amp: f32, len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    let t = i as f32 / sr;
+                    amp * (0.4 * (std::f32::consts::TAU * 350.0 * t).sin()
+                        + 0.35 * (std::f32::consts::TAU * 900.0 * t).sin()
+                        + 0.35 * (std::f32::consts::TAU * 1_900.0 * t).sin())
+                })
+                .collect()
+        };
+        let spectral_tilt_ratio = |buf: &[f32]| -> f32 {
+            let n = 2048usize;
+            let mut spec = vec![-120.0_f32; n / 2];
+            compute_spectrum_db(&buf[buf.len() - n..], &mut spec);
+            let bin_hz = sr / n as f32;
+            let k_lo = (350.0 / bin_hz).round() as usize;
+            let k_hi = (1_900.0 / bin_hz).round() as usize;
+            spec[k_hi] - spec[k_lo]
+        };
+
+        // Auto Up: señal fuerte debe favorecer agudos (1900 Hz) frente a señal débil.
+        wah.set_mode(1.0);
+        wah.set_position(10.0);
+        wah.set_sensitivity(80.0);
+        wah.prepare(sr, 128);
+        let mut quiet = make_chord(0.01, 4096);
+        wah.process(&mut quiet);
+        let ratio_quiet_up = spectral_tilt_ratio(&quiet);
+
+        wah.reset();
+        let mut hot = make_chord(0.7, 4096);
+        wah.process(&mut hot);
+        let ratio_hot_up = spectral_tilt_ratio(&hot);
+        assert!(
+            ratio_hot_up > ratio_quiet_up + 4.0,
+            "Auto Up should sweep upward with hot signal: quiet={ratio_quiet_up:.2}, hot={ratio_hot_up:.2}"
+        );
+
+        // Auto Down: señal fuerte barre hacia abajo respecto a señal débil.
+        wah.set_mode(2.0);
+        wah.set_position(95.0);
+        wah.prepare(sr, 128);
+        let mut quiet_d = make_chord(0.01, 4096);
+        wah.process(&mut quiet_d);
+        let ratio_quiet_down = spectral_tilt_ratio(&quiet_d);
+
+        wah.reset();
+        let mut hot_d = make_chord(0.7, 4096);
+        wah.process(&mut hot_d);
+        let ratio_hot_down = spectral_tilt_ratio(&hot_d);
+        assert!(
+            ratio_hot_down < ratio_quiet_down - 4.0,
+            "Auto Down should sweep downward with hot signal: quiet={ratio_quiet_down:.2}, hot={ratio_hot_down:.2}"
+        );
+
+        // Conmutación en vivo Manual -> Auto Up -> Auto Down sin NaN ni saltos bruscos.
+        wah.prepare(sr, 64);
+        let mut sweep_sig = make_chord(0.35, 2048);
+        for (blk_idx, ch) in sweep_sig.chunks_mut(64).enumerate() {
+            if blk_idx == 8 {
+                wah.set_mode(0.0);
+            } else if blk_idx == 16 {
+                wah.set_mode(2.0);
+            }
+            wah.process(ch);
+            assert!(ch.iter().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn cabinet_ir_upols_zero_latency_and_exact_vs_direct_convolution() {
+        let sr = 48_000.0_f32;
+        let ir_len = 2_500usize;
+        let ir: Vec<f32> = (0..ir_len)
+            .map(|k| {
+                let env = (-(k as f32) / 380.0).exp();
+                let osc = (k as f32 * 0.27).cos() * 0.6 + (k as f32 * 0.81).sin() * 0.4;
+                let impulse = if k == 0 { 0.45 } else { 0.0 };
+                impulse + env * osc * 0.15
+            })
+            .collect();
+
+        // 1) Verifica latencia exacta = 0 muestras en CabinetIr + UpolsConvolver.
+        let mut cab = CabinetIr::new();
+        assert_eq!(cab.latency_samples(), 0);
+        cab.prepare(sr, 64);
+        cab.set_low_cut_hz(20.0);
+        cab.set_high_cut_hz(18_000.0);
+        cab.set_mix(100.0);
+        cab.set_level_db(0.0);
+        cab.load_test_ir_unscaled(&ir);
+        let mut imp = vec![0.0_f32; 128];
+        imp[0] = 1.0;
+        cab.process(&mut imp);
+        assert!(
+            imp[0].abs() > 0.05,
+            "CabinetIr must output immediately at sample 0 (0-latency): y[0]={}",
+            imp[0]
+        );
+
+        // 2) Identidad matemática exacta de UpolsConvolver vs convolución directa en tiempo (ESR < -115 dB).
+        let mut conv = UpolsConvolver::new(sr);
+        let parts = PreparedIrPartitions::from_ir(&ir, sr);
+        conv.load_partitions(&parts);
+
+        let n = 8_192usize;
+        let input: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr;
+                0.4 * (std::f32::consts::TAU * 190.0 * t).sin()
+                    + 0.35 * (std::f32::consts::TAU * 830.0 * t).cos()
+                    + 0.25 * (std::f32::consts::TAU * 2_910.0 * t).sin()
+            })
+            .collect();
+
+        // Convolución directa de referencia en f64.
+        let mut y_ref = vec![0.0_f32; n];
+        for (idx, dst) in y_ref.iter_mut().enumerate() {
+            let mut acc = 0.0_f64;
+            let k_max = ir.len().min(idx + 1);
+            for k in 0..k_max {
+                acc += (ir[k] as f64) * (input[idx - k] as f64);
+            }
+            *dst = acc as f32;
+        }
+
+        // Procesa en bloques irregulares [1, 17, 64, 128, 511] para validar invarianza al tamaño de buffer.
+        let mut y_upols = input.clone();
+        let sizes = [1usize, 17, 64, 128, 511];
+        let mut offset = 0usize;
+        let mut s_idx = 0usize;
+        while offset < n {
+            let chunk_len = sizes[s_idx % sizes.len()].min(n - offset);
+            for s in &mut y_upols[offset..offset + chunk_len] {
+                *s = conv.process_sample(*s);
+            }
+            offset += chunk_len;
+            s_idx += 1;
+        }
+
+        assert!(
+            (y_upols[0] - y_ref[0]).abs() < 1e-6,
+            "Sample 0 mismatch: upols={} ref={}",
+            y_upols[0],
+            y_ref[0]
+        );
+        let esr_db = compute_esr_db(&y_ref, &y_upols);
+        println!(
+            "UPOLS_BENCH: ir_len={ir_len} block_b={} esr_db={esr_db:.2}",
+            conv.block_size()
+        );
+        assert!(
+            esr_db < -115.0,
+            "UPOLS vs direct convolution ESR too high: {esr_db:.2} dB"
+        );
+    }
+
+    #[test]
+    fn cabinet_ir_wav_roundtrip_resample_and_builtin_rolloff() {
+        // 1) Roundtrip WAV 96 kHz -> parser -> resample sinc 48 kHz -> normalización en banda.
+        let sr_in = 96_000u32;
+        let sr_out = 48_000u32;
+        let mut raw_ir = vec![0.0_f32; 2400];
+        raw_ir[0] = 0.2;
+        for (i, s) in raw_ir.iter_mut().enumerate().skip(1) {
+            let t = i as f32 / sr_in as f32;
+            *s = 0.08 * (-t * 95.0).exp() * (std::f32::consts::TAU * 650.0 * t).cos();
+        }
+        let wav_bytes = wav::write_wav_f32_mono(sr_in, &raw_ir);
+        let parsed = wav::parse_wav_bytes(&wav_bytes).expect("parse generated wav");
+        assert_eq!(parsed.sample_rate, sr_in);
+        assert_eq!(parsed.channels, 1);
+        assert_eq!(parsed.samples.len(), raw_ir.len());
+
+        let mut resampled = wav::resample_ir_sinc(&parsed.samples, sr_in, sr_out, 4800);
+        assert_eq!(resampled.len(), 1200);
+        wav::normalize_ir_guitar_band(&mut resampled, sr_out as f32);
+        let parts = PreparedIrPartitions::from_ir(&resampled, sr_out as f32);
+        assert_eq!(parts.block_size, 64);
+
+        // 2) Los 3 modelos integrados deben atenuar severamente >= 18 dB a 10 kHz vs 1 kHz en 44.1-192 kHz.
+        let mut cab = CabinetIr::new();
+        for &sr in &[44_100.0_f32, 48_000.0, 96_000.0, 192_000.0] {
+            for model in 0..3 {
+                cab.set_model(model as f32);
+                cab.set_low_cut_hz(20.0);
+                cab.set_high_cut_hz(18_000.0);
+                cab.set_mix(100.0);
+                cab.set_level_db(0.0);
+                cab.prepare(sr, 256);
+
+                let measure_rms = |c: &mut CabinetIr, freq: f32| -> f32 {
+                    c.reset();
+                    let warmup = (0.06 * sr) as usize;
+                    let n = 4096usize;
+                    let (mut sig, _) = generate_coherent_sine(freq, sr, warmup + n, 0.25);
+                    for ch in sig.chunks_mut(256) {
+                        c.process(ch);
+                    }
+                    compute_waveform_metrics(&sig[warmup..]).rms_db
+                };
+
+                let rms_1k = measure_rms(&mut cab, 1_000.0);
+                let rms_10k = measure_rms(&mut cab, 10_000.0);
+                let atten_db = rms_1k - rms_10k;
+                assert!(
+                    atten_db >= 18.0,
+                    "Cabinet model {model} @ {sr} Hz insufficient HF rolloff: {atten_db:.2} dB (1k={rms_1k:.2}, 10k={rms_10k:.2})"
+                );
+            }
+        }
     }
 }

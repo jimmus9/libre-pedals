@@ -1,6 +1,6 @@
 # Capítulo 4 — Filtros, Gabinete (IR), Modulación, Delay y Reverb
 
-> **Estado:** ✅ Cerrado (`v1.1` — `D13` Opción B; `D14`–`D17` Opción A).  
+> **Estado:** ✅ Cerrado (`v1.2` — **Ola 4 implementada y auditada**; Modulación y Tiempo listos para Ola 5; `D13` Opción B, `D14`–`D17` Opción A).  
 > **Pedales cubiertos:** EQ Paramétrico *(4 bandas)* · Wah / Auto-Wah · Simulador de Gabinete (*Cabinet IR* por convolución) · Chorus, Phaser y Tremolo · Delay (*Digital / Analógico BBD / Tape*) · Reverb (*Plate / Hall / Spring*).  
 > **Base previa aplicada:** fórmulas *matched* de Vicanek/Orfanidis sin *cramping* para EQ en todas las $f_s$ (`D2`), filtros modulables Cytomic SVF-TPT (`D2`), selectores `Stepped` con *crossfade* ($5\text{–}10\text{ ms}$), acumulación `f64` (`D3`) y protección FTZ/DAZ contra *denormals*.
 
@@ -143,3 +143,35 @@ Con estas últimas 5 decisiones (`D13`–`D17`) se cierra la fase de investigaci
 | **D15** | **`Cabinet IR` (Convolución)** | **A)** Convolución híbrida de latencia cero (cabeza directa + cola FFT UPOLS) con **3 IRs integradas** + carga de `.wav` externos + `Low-Cut`/`High-Cut`<br>**B)** Solo las 3 IRs integradas sin carga de `.wav` | Opción A | ✅ **Opción A**: convolución UPOLS de latencia cero con **3 IRs libres integradas** + carga de `.wav` externos + `Low-Cut`/`High-Cut` |
 | **D16** | **`Modulación`** | **A)** Tres pedales independientes y simples: **`Chorus`**, **`Phaser`** y **`Tremolo`** (`Óptico / Harmonic`)<br>**B)** Un único multi-pedal de modulación | Opción A | ✅ **Opción A**: tres pedales independientes (**`Chorus`**, **`Phaser`**, **`Tremolo`**) para poder intercalarlos libremente en la cadena |
 | **D17** | **`Delay` y `Reverb`** | **A)** Un pedal **`Delay`** multimodo (`Digital / BBD / Tape`) y un pedal **`Reverb`** multimodo (`Plate / Hall / Spring`)<br>**B)** Pedales separados para cada carácter (6 pedales) | Opción A | ✅ **Opción A**: **`Delay`** multimodo (`Digital / BBD / Tape`) y **`Reverb`** multimodo (`Plate / Hall / Spring`) manteniendo 13 familias ordenadas |
+
+---
+
+## 9. Verificación Experimental y Auditoría de Latencia / CPU (Ola 4 — `v1.2`)
+
+Métricas reales medidas tras implementar **EQ Paramétrico** (`crates/dsp/src/parametric_eq.rs`), **Wah / Auto-Wah** (`crates/dsp/src/wah.rs`) y **Cabinet IR UPOLS** (`crates/dsp/src/cabinet_ir.rs` + `crates/dsp/src/wav.rs`) e integrarlos con telemetría en vivo en `crates/engine`:
+
+### 9.1 Precisión Matemática (`UpolsConvolver`, `ParametricEq`, `Wah`)
+- **Cabinet IR `UPOLS` frente a convolución directa en el tiempo (`f64`):** sobre una IR de `2500` muestras (`64` muestras de cabeza + `39` particiones de cola a `48 kHz`) y señal multitono de `8192` muestras procesada en bloques irregulares (`1, 17, 64, 128, 511`), la respuesta en `n = 0` coincide exactamente (`0` muestras de latencia) y el error energético relativo es **`ESR = -117.21 dB`** (en el límite del piso de precisión simple `f32`).
+- **Cabinet IR integrados (`1x12 Clean`, `2x12 Crunch`, `4x12 High-Gain`):** caída de agudos verificada `>= 18 dB` a `10 kHz` frente a `1 kHz` en todo el rango `44.1–192 kHz` + normalización RMS espectral en banda de guitarra (`120–3500 Hz`) tanto para modelos integrados como para `.wav` externos.
+- **EQ Paramétrico 4 bandas (*matched*):** error `< 0.25 dB` frente a la curva analítica objetivo y simetría *boost/cut* `< 0.10 dB` en `44.1–192 kHz`, preservando el ancho de banda de la campana a `8 kHz` y `High Shelf` a `10 kHz` entre `44.1 kHz` y `192 kHz` (`< 0.6 dB` de diferencia sin *cramping*).
+
+### 9.2 Latencia Algorítmica por Pedal (`Effect::latency_samples`)
+
+| Pedal | Arquitectura | Latencia (`48 kHz`) | Latencia (`96 kHz`) |
+|---|---|---|---|
+| **Noise Gate** | *Lookahead* `1.00 ms` + *sidechain* 4.º orden | `48` muestras (`1.00 ms`) | `96` muestras (`1.00 ms`) |
+| **Brickwall Limiter** | *Lookahead* `1.50 ms` + FIR *True-Peak* `8` muestras (`0` a `>=176.4k`) | `80` muestras (`1.67 ms`) | `152` muestras (`1.58 ms`) |
+| **Clean Boost / Overdrive / 12AX7 / SoftClipTape** | `HIIR` + `ADAA1` sin *lookahead* | `0` muestras (`0.00 ms`) | `0` muestras (`0.00 ms`) |
+| **Opto Compressor** | Envolvente T4B *feedback* | `0` muestras (`0.00 ms`) | `0` muestras (`0.00 ms`) |
+| **Parametric EQ / Wah / Cabinet IR (`UPOLS`)** | Filtros ZDF / *Matched* + cabeza directa `UPOLS` | **`0` muestras (`0.00 ms`)** | **`0` muestras (`0.00 ms`)** |
+
+### 9.3 Auditoría Comparativa de `% CPU` en `--release` (Ola 3 vs. Ola 4)
+Medición real sobre 2 segundos de audio en bloques de `128` muestras incluyendo `sync_chain_from_params` por bloque (`cargo test --release -p engine`):
+
+| Configuración del *Stack* | `48 kHz` `% CPU` | `48 kHz` Latencia Stack | `96 kHz` `% CPU` | `96 kHz` Latencia Stack |
+|---|---|---|---|---|
+| **Ola 3 (7 pedales activos):** `Gate + Opto + Boost + OD + 12AX7 + Tape + Limiter` | `5.74%` | `128` m (`2.67 ms`) | `6.02%` | `248` m (`2.58 ms`) |
+| **Ola 3 + Ola 4 (10 pedales simultáneos):** `+ Wah + Parametric EQ + Cabinet IR (UPOLS)` | **`6.21%`** (`+0.47%`) | `128` m (`2.67 ms`) | **`7.71%`** (`+1.69%`) | `248` m (`2.58 ms`) |
+| **Aporte incremental de Ola 4 (`Wah + Parametric EQ + Cabinet IR`):** *(diferencia medida vs. Ola 3)* | `+0.47%` | **`0` m (`0.00 ms`)** | `+1.69%` | **`0` m (`0.00 ms`)** |
+
+> **Conclusión de ingeniería:** Sumar **EQ Paramétrico + Wah + Cabinet IR (`UPOLS`)** añade **`0.00 ms` de latencia algorítmica** y menos de **`0.5%`–`1.7%` de CPU** en `--release` a `48–96 kHz`, manteniendo amplio margen de tiempo real antes de incorporar Modulación y Tiempo en la **Ola 5**.

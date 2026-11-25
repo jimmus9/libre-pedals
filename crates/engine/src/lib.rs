@@ -14,8 +14,9 @@ use cpal::{
     SupportedBufferSize, SupportedStreamConfig,
 };
 use dsp::{
-    db_to_lin, BrickwallLimiter, Chain, CleanBoost, Effect, Gain, NoiseGate, OptoCompressor,
-    Overdrive, Resampler, ScopedNoDenormals, SoftClipTape, TubePreamp,
+    db_to_lin, BrickwallLimiter, CabinetIr, Chain, CleanBoost, Effect, Gain, NoiseGate,
+    OptoCompressor, Overdrive, ParametricEq, Resampler, ScopedNoDenormals, SoftClipTape,
+    TubePreamp, Wah,
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -326,13 +327,7 @@ fn build_stream_pair_with_fallback(
         };
 
         // Preparamos la cadena DSP a la frecuencia de procesamiento (`proc_sample_rate`).
-        let mut chain = build_pedalboard_chain(params);
-        let max_block = if proc_sample_rate == out_supported.sample_rate() {
-            SCRATCH_FRAMES
-        } else {
-            MICRO_BLOCK_FRAMES
-        };
-        chain.prepare(proc_sample_rate as f32, max_block);
+        let chain = build_pedalboard_chain(params, proc_sample_rate, out_supported.sample_rate());
 
         let mut out_cfg = out_supported.config();
         out_cfg.buffer_size = out_buf_mode;
@@ -472,16 +467,25 @@ pub fn default_pedalboard_chain() -> Chain {
         chain.push(NoiseGate::new(-60.0), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
-        chain.push(CleanBoost::new(), false);
+        chain.push(Wah::new(), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
         chain.push(OptoCompressor::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(CleanBoost::new(), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
         chain.push(Overdrive::new(), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
         chain.push(TubePreamp::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(ParametricEq::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(CabinetIr::new(), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
         chain.push(SoftClipTape::new(), false);
@@ -491,6 +495,28 @@ pub fn default_pedalboard_chain() -> Chain {
     }
     chain.push(Gain::new(-6.0), false);
     chain
+}
+
+/// Estima sin asignar memoria la latencia algorítmica acumulada (en muestras a `sample_rate`)
+/// de todos los pedales montados y activos en `params`.
+pub fn estimate_chain_latency_samples(params: &Params, sample_rate: u32) -> usize {
+    let sr = (sample_rate as f64).max(1.0);
+    let gate_samples = (0.001 * sr).round().max(1.0) as usize;
+    let limiter_lookahead = (0.0015 * sr).round().max(1.0) as usize;
+    let limiter_det_delay = if sr >= 176_400.0 { 0 } else { 8 };
+    let limiter_samples = limiter_lookahead + limiter_det_delay;
+
+    params
+        .mounted_cascade()
+        .into_iter()
+        .filter_map(|idx| params.slots().get(idx))
+        .filter(|slot| !slot.bypass())
+        .map(|slot| match slot.kind {
+            "noise_gate" => gate_samples,
+            "limiter" => limiter_samples,
+            _ => 0,
+        })
+        .sum()
 }
 
 #[inline]
@@ -517,20 +543,43 @@ fn apply_level_ramp(block: &mut [f32], current_gain: &mut f32, target_gain: f32)
     *current_gain = target_gain;
 }
 
-fn build_pedalboard_chain(params: &Params) -> Chain {
+fn build_pedalboard_chain(params: &Params, proc_sample_rate: u32, out_sample_rate: u32) -> Chain {
     let mut chain = default_pedalboard_chain();
-    sync_chain_from_params(&mut chain, params);
+    let max_block = if proc_sample_rate == out_sample_rate {
+        SCRATCH_FRAMES
+    } else {
+        MICRO_BLOCK_FRAMES
+    };
+    chain.prepare(proc_sample_rate as f32, max_block);
+    sync_chain_from_params(&mut chain, params, proc_sample_rate);
     chain
 }
 
 #[inline]
-fn sync_chain_from_params(chain: &mut Chain, params: &Params) {
+pub fn sync_chain_from_params(chain: &mut Chain, params: &Params, proc_sample_rate: u32) {
     chain.sync_order_from(|pos| params.order_at(pos));
     for (slot_idx, slot_params) in params.slots().iter().enumerate() {
         if let Some((fx, bypass)) = chain.slot_mut(slot_idx) {
             *bypass = slot_params.bypass() || !slot_params.is_mounted();
             for p_idx in 0..slot_params.param_count() {
                 fx.set_param(p_idx, slot_params.get(p_idx));
+            }
+            if slot_params.kind == "cabinet_ir" {
+                let ver = slot_params.custom_ir_version();
+                if let Some(cab) = fx.as_any_mut().downcast_mut::<CabinetIr>() {
+                    if ver != cab.loaded_custom_version() {
+                        slot_params.try_with_custom_ir(|opt_asset| match opt_asset {
+                            Some(asset) => {
+                                if let Some(parts) = asset.partitions_for_rate(proc_sample_rate) {
+                                    cab.install_custom_partitions(ver, parts);
+                                } else {
+                                    cab.clear_custom_ir(ver);
+                                }
+                            }
+                            None => cab.clear_custom_ir(ver),
+                        });
+                    }
+                }
             }
         }
     }
@@ -796,6 +845,7 @@ where
     let mut test_phase2 = 0.0_f64;
     let proc_sr_f64 = (proc_sample_rate as f64).max(1.0);
     let meters_err = Arc::clone(&meters);
+    let mut smooth_cpu_pct = 0.0_f32;
 
     let stream = dev.build_output_stream(
         config,
@@ -805,8 +855,10 @@ where
             if frames_needed == 0 {
                 return;
             }
+            let cb_start = std::time::Instant::now();
 
-            sync_chain_from_params(&mut chain, &params);
+            sync_chain_from_params(&mut chain, &params, proc_sample_rate);
+            let stack_latency_samples = chain.latency_samples() as u32;
             let muted = params.mute();
             let test_mode = params.test_signal_mode();
             let test_freq = params.test_freq_hz();
@@ -962,6 +1014,19 @@ where
                 meters.underruns.fetch_add(1, Ordering::Relaxed);
             }
             meters.output_peak.fetch_max_abs(out_peak);
+
+            let elapsed_s = cb_start.elapsed().as_secs_f64();
+            let budget_s = (frames_needed as f64 / out_sample_rate.max(1) as f64).max(1e-6);
+            let inst_cpu = ((elapsed_s / budget_s) * 100.0) as f32;
+            smooth_cpu_pct = if smooth_cpu_pct == 0.0 {
+                inst_cpu
+            } else {
+                0.85 * smooth_cpu_pct + 0.15 * inst_cpu
+            };
+            meters.dsp_cpu_percent.store(smooth_cpu_pct);
+            meters
+                .dsp_latency_samples
+                .store(stack_latency_samples, Ordering::Relaxed);
         },
         move |_err| {
             meters_err.stream_errors.fetch_add(1, Ordering::Relaxed);
@@ -970,4 +1035,171 @@ where
     )?;
 
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stack_latency_matches_chain_and_bypass_toggles() {
+        for &sr in &[44_100_u32, 48_000, 96_000, 192_000] {
+            let params = Params::default();
+            // Montar solo pedales de Ola 4 (Wah + ParametricEq + CabinetIr) -> 0 muestras.
+            let wah_idx = params.mount_new_instance("wah").unwrap();
+            let eq_idx = params.mount_new_instance("parametric_eq").unwrap();
+            let cab_idx = params.mount_new_instance("cabinet_ir").unwrap();
+            params.set_cascade(&[wah_idx, eq_idx, cab_idx]);
+
+            let mut chain = build_pedalboard_chain(&params, sr, sr);
+            assert_eq!(chain.latency_samples(), 0);
+            assert_eq!(estimate_chain_latency_samples(&params, sr), 0);
+
+            // Cadena completa incluyendo Gate y Limiter activos.
+            let gate_idx = params.mount_new_instance("noise_gate").unwrap();
+            let comp_idx = params.mount_new_instance("opto_comp").unwrap();
+            let boost_idx = params.mount_new_instance("clean_boost").unwrap();
+            let od_idx = params.mount_new_instance("overdrive").unwrap();
+            let tube_idx = params.mount_new_instance("tube_preamp").unwrap();
+            let tape_idx = params.mount_new_instance("soft_clipper").unwrap();
+            let lim_idx = params.mount_new_instance("limiter").unwrap();
+            params.set_cascade(&[
+                gate_idx, wah_idx, comp_idx, boost_idx, od_idx, tube_idx, eq_idx, cab_idx,
+                tape_idx, lim_idx,
+            ]);
+            sync_chain_from_params(&mut chain, &params, sr);
+
+            let lat = chain.latency_samples();
+            assert_eq!(lat, estimate_chain_latency_samples(&params, sr));
+            if sr == 48_000 {
+                // NoiseGate (48) + BrickwallLimiter (72 + 8 = 80) = 128 muestras (2.67 ms).
+                assert_eq!(lat, 128);
+            }
+
+            // Verifica retardo físico exacto de pico ante impulso con Gate abierto + Limiter limpio.
+            params.slots()[gate_idx].set_by_id("threshold_db", -100.0);
+            params.slots()[comp_idx].set_bypass(true);
+            params.slots()[boost_idx].set_bypass(true);
+            params.slots()[od_idx].set_bypass(true);
+            params.slots()[tube_idx].set_bypass(true);
+            params.slots()[eq_idx].set_bypass(true);
+            params.slots()[cab_idx].set_bypass(true);
+            params.slots()[tape_idx].set_bypass(true);
+            params.slots()[wah_idx].set_bypass(true);
+            sync_chain_from_params(&mut chain, &params, sr);
+            chain.reset();
+
+            let mut buf = vec![0.0_f32; 512];
+            buf[0] = 0.25;
+            chain.process(&mut buf);
+            let peak_idx = buf
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
+            assert_eq!(
+                peak_idx, lat,
+                "Impulse delay {peak_idx} != latency_samples {lat} at {sr} Hz"
+            );
+
+            // Bypass Gate y Limiter vuelve inmediatamente a 0 muestras.
+            params.slots()[gate_idx].set_bypass(true);
+            params.slots()[lim_idx].set_bypass(true);
+            sync_chain_from_params(&mut chain, &params, sr);
+            assert_eq!(chain.latency_samples(), 0);
+            assert_eq!(estimate_chain_latency_samples(&params, sr), 0);
+        }
+    }
+
+    #[test]
+    fn full_stack_cpu_budget_and_custom_wav_preset_roundtrip() {
+        let sr = 48_000_u32;
+        let params = Params::default();
+        let gate_idx = params.first_slot_of_kind("noise_gate").unwrap().0;
+        let wah_idx = params.mount_new_instance("wah").unwrap();
+        let comp_idx = params.mount_new_instance("opto_comp").unwrap();
+        let boost_idx = params.mount_new_instance("clean_boost").unwrap();
+        let od_idx = params.first_slot_of_kind("overdrive").unwrap().0;
+        let tube_idx = params.mount_new_instance("tube_preamp").unwrap();
+        let eq_idx = params.mount_new_instance("parametric_eq").unwrap();
+        let cab_idx = params.mount_new_instance("cabinet_ir").unwrap();
+        let tape_idx = params.mount_new_instance("soft_clipper").unwrap();
+        let lim_idx = params.mount_new_instance("limiter").unwrap();
+
+        // 1) Verifica carga de archivo .wav en disco y round-trip de Preset con ir_path.
+        let mut ir = vec![0.0_f32; 1024];
+        ir[0] = 0.8;
+        ir[45] = -0.25;
+        let wav_bytes = dsp::wav::write_wav_f32_mono(sr, &ir);
+        let wav_path = std::env::temp_dir().join("libre_pedals_test_cab_ir.wav");
+        std::fs::write(&wav_path, &wav_bytes).expect("write temp wav");
+
+        params.slots()[cab_idx]
+            .load_custom_ir_from_path(&wav_path)
+            .expect("load custom wav");
+        params.slots()[cab_idx].set_by_id("model", 3.0);
+
+        params.set_cascade(&[
+            gate_idx, wah_idx, comp_idx, boost_idx, od_idx, tube_idx, eq_idx, cab_idx, tape_idx,
+            lim_idx,
+        ]);
+
+        let captured = Preset::capture(&params, "Test Custom IR");
+        let json = captured.to_json_pretty().expect("serialize preset");
+        let parsed = Preset::from_json(&json).expect("deserialize preset");
+        let target = Params::default();
+        let warnings = parsed.apply(&target);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert!(captured.same_sound(&Preset::capture(&target, "Recap")));
+
+        let _ = std::fs::remove_file(&wav_path);
+
+        // 2) Auditoría de rendimiento DSP comparativa Ola 3 vs Ola 3+4 a 48 kHz y 96 kHz (bloque 128).
+        let ola3_cascade = [
+            gate_idx, comp_idx, boost_idx, od_idx, tube_idx, tape_idx, lim_idx,
+        ];
+        let ola4_full_cascade = [
+            gate_idx, wah_idx, comp_idx, boost_idx, od_idx, tube_idx, eq_idx, cab_idx, tape_idx,
+            lim_idx,
+        ];
+
+        for &bench_sr in &[48_000_u32, 96_000] {
+            for &(label, cascade) in &[
+                ("ola3_7_pedals", ola3_cascade.as_slice()),
+                ("ola4_10_pedals", ola4_full_cascade.as_slice()),
+            ] {
+                params.set_cascade(cascade);
+                let mut chain = build_pedalboard_chain(&params, bench_sr, bench_sr);
+                let mut block = vec![0.0_f32; 128];
+                let total_blocks = (bench_sr as usize * 2) / 128;
+                let mut max_abs = 0.0_f32;
+
+                let t0 = std::time::Instant::now();
+                for b in 0..total_blocks {
+                    for (i, s) in block.iter_mut().enumerate() {
+                        let n = (b * 128 + i) as f32 / bench_sr as f32;
+                        *s = 0.18 * (std::f32::consts::TAU * 220.0 * n).sin();
+                    }
+                    sync_chain_from_params(&mut chain, &params, bench_sr);
+                    chain.process(&mut block);
+                    for &s in &block {
+                        assert!(s.is_finite());
+                        max_abs = max_abs.max(s.abs());
+                    }
+                }
+                let elapsed_s = t0.elapsed().as_secs_f64();
+                let cpu_pct = (elapsed_s / 2.0) * 100.0;
+                println!(
+                    "AUDITORIA_CPU: sr={bench_sr} stack={label} cpu_pct={cpu_pct:.2}% latency_samples={} latency_ms={:.2} peak={max_abs:.3}",
+                    chain.latency_samples(),
+                    chain.latency_samples() as f32 * 1000.0 / bench_sr as f32
+                );
+                #[cfg(not(debug_assertions))]
+                assert!(cpu_pct < 20.0, "Release CPU budget exceeded: {cpu_pct:.2}%");
+                #[cfg(debug_assertions)]
+                assert!(cpu_pct < 98.0, "Debug CPU budget exceeded: {cpu_pct:.2}%");
+            }
+        }
+    }
 }

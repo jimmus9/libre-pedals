@@ -2,7 +2,7 @@
   "format_version": 1,
   "name": "Tube Stack (Boost + 12AX7)",
   "author": "libre-pedals",
-  "description": "Clean Boost JFET empujando al Preamp de válvula 12AX7 de 3 etapas",
+  "description": "Clean Boost JFET empujando al Preamp de válvula 12AX7 con gabinete 2x12 Crunch",
   "chain": [
     {
       "id": "noise_gate-1",
@@ -32,8 +32,20 @@
         "gain_db": 24.0,
         "stages": 1.0,
         "bias": 55.0,
-        "tone_db": 2.0,
-        "level_db": -10.0
+        "tone_db": 2.5,
+        "level_db": -9.0
+      }
+    },
+    {
+      "id": "cabinet_ir-1",
+      "pedal": "cabinet_ir",
+      "enabled": true,
+      "params": {
+        "model": 1.0,
+        "low_cut_hz": 85.0,
+        "high_cut_hz": 8000.0,
+        "mix": 100.0,
+        "level_db": 0.0
       }
     }
   ],

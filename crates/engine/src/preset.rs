@@ -36,6 +36,8 @@ pub struct PresetPedal {
     pub enabled: bool,
     #[serde(default)]
     pub params: BTreeMap<String, f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ir_path: Option<String>,
 }
 
 impl Preset {
@@ -57,12 +59,18 @@ impl Preset {
             } else {
                 Some(raw_label)
             };
+            let ir_path = if slot.kind == "cabinet_ir" {
+                slot.custom_ir_info().map(|(_, p)| p)
+            } else {
+                None
+            };
             chain.push(PresetPedal {
                 id: format!("{}-{}", slot.kind, slot.instance),
                 pedal: slot.kind.to_string(),
                 label,
                 enabled: !slot.bypass(),
                 params: map,
+                ir_path,
             });
         }
 
@@ -142,6 +150,7 @@ impl Preset {
             slot.reset_defaults();
             slot.set_bypass(!entry.enabled);
             slot.set_label(entry.label.as_deref().unwrap_or(""));
+            slot.set_custom_ir(None);
 
             for (param_id, &val) in &entry.params {
                 let Some((p_idx, spec)) = slot
@@ -174,6 +183,22 @@ impl Preset {
                     ));
                 }
                 slot.set(p_idx, val);
+            }
+
+            if slot.kind == "cabinet_ir" {
+                if let Some(ref raw_path) = entry.ir_path {
+                    let trimmed = raw_path.trim();
+                    if !trimmed.is_empty() {
+                        if let Err(err) =
+                            slot.load_custom_ir_from_path(std::path::Path::new(trimmed))
+                        {
+                            warnings.push(format!(
+                                "No se pudo cargar IR '{}' en '{}': {err}",
+                                trimmed, entry.id
+                            ));
+                        }
+                    }
+                }
             }
 
             mounted_slots.push(slot_idx);
@@ -215,6 +240,19 @@ impl Preset {
             let la = a.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
             let lb = b.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
             if la != lb {
+                return false;
+            }
+            let ia = a
+                .ir_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let ib = b
+                .ir_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if ia != ib {
                 return false;
             }
             if a.params.len() != b.params.len() {
@@ -276,6 +314,7 @@ mod tests {
                     label: Some("Boost".to_string()),
                     enabled: true,
                     params: BTreeMap::from([("drive_db".to_string(), 4.0)]),
+                    ir_path: None,
                 },
                 PresetPedal {
                     id: "od-2".to_string(),
@@ -283,6 +322,7 @@ mod tests {
                     label: Some("Drive".to_string()),
                     enabled: false,
                     params: BTreeMap::from([("drive_db".to_string(), 28.0)]),
+                    ir_path: None,
                 },
             ],
             preset_level_db: 0.0,
@@ -307,6 +347,7 @@ mod tests {
                 label: None,
                 enabled: true,
                 params: BTreeMap::new(),
+                ir_path: None,
             })
             .collect();
         let warnings = two.apply(&params);
@@ -330,6 +371,7 @@ mod tests {
                     ("drive_db".to_string(), 99.0),
                     ("param_inexistente".to_string(), 1.0),
                 ]),
+                ir_path: None,
             }],
             preset_level_db: 0.0,
         };

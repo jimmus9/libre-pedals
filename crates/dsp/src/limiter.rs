@@ -189,6 +189,10 @@ impl Effect for BrickwallLimiter {
         &LIMITER_PARAMS
     }
 
+    fn latency_samples(&self) -> usize {
+        self.audio_delay.len()
+    }
+
     fn get_param(&self, index: usize) -> f32 {
         match index {
             0 => self.drive_db,
