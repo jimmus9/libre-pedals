@@ -278,7 +278,7 @@ pub fn compute_harmonic_metrics(
     let mut even_power = 0.0_f64;
     let mut odd_power = 0.0_f64;
 
-    for m in 2..=15_usize {
+    for m in 2..=32_usize {
         let hm_hz = fund_hz * m as f32;
         if hm_hz >= 0.48 * sample_rate {
             break;

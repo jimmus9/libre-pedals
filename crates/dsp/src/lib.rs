@@ -2,6 +2,7 @@ use std::any::Any;
 
 pub mod adaa;
 pub mod analyzer;
+pub mod d5_experiment;
 pub mod denormals;
 pub mod gain;
 pub mod gate;

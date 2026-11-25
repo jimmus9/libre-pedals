@@ -1,6 +1,6 @@
 # Capítulo 2 — Saturación, Overdrive y Preamps de Válvula
 
-> **Estado:** ✅ Cerrado (`v1.1` — decisiones `D5`–`D8` aprobadas; experimento comparativo `D5` acotado para ejecución y gráficas en prototipado).  
+> **Estado:** ✅ Cerrado (`v1.2` — decisiones `D5`–`D8` aprobadas; experimento comparativo `D5` ejecutado y documentado con gráficas SVG).  
 > **Pedales cubiertos:** Clean Boost / Preamp · Overdrive unificado (TS-808 / Asimétrico SD-1 / Transparente Klon-Bluesbreaker) · Preamp de Válvula (Tríodo 12AX7 en cascada).  
 > **Base del Capítulo 1 aplicada:** antialiasing híbrido adaptativo ($M(f_s)$ + `ADAA1`), filtros modulables Cytomic SVF-TPT, selectores `Stepped` sin clics, acumulación interna en `f64` y validación objetiva (THD, $H_2/H_3$, IMD, ASNR y ESR).
 
@@ -163,14 +163,27 @@ Para comparar con rigor científico y datos reproducibles si el modelado físico
    - **E2 (Aliasing en agudos):** seno coherente en torno a $4.5\text{ kHz}$ ($-6\text{ dBFS}$).
    - **E3 (Acordes / IMD):** doble tono en quinta justa ($220 + 330\text{ Hz}$) y tercera mayor ($220 + 277.18\text{ Hz}$).
    - **E4 (Transitorio dinámico):** pulso de cuerda sintético con ataque rápido y decaimiento exponencial.
-6. **Métricas registradas y tabla comparativa (se completará con datos y gráficas en el prototipado):**
+6. **Métricas registradas y tabla comparativa (medidas reales en `--release`, implementadas en [`crates/dsp/src/d5_experiment.rs`](../../crates/dsp/src/d5_experiment.rs) y reproducibles con `cargo run --release -p dsp --example d5_report`):**
 
-| Modelo / Tasa | $\text{ESR}_{\text{dB}}$ vs. *Ground Truth* | THD ($440\text{ Hz}$) | $H_{2/3}$ (dB) | IMD (dB) | $\text{ASNR}_{\text{dB}}$ ($4.5\text{ kHz}$) | CPU (ns/muestra) | Latencia (muestras) |
-|---|---|---|---|---|---|---|---|
-| **White-Box WDF + Wright $\omega$ ($48\text{ kHz}$)** | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* |
-| **Gray-Box + `ADAA1` ($48\text{ kHz}$)** | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* |
-| **White-Box WDF + Wright $\omega$ ($192\text{ kHz}$)** | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* |
-| **Gray-Box + `ADAA1` ($192\text{ kHz}$)** | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* | *Pendiente* |
+| Modelo / Tasa | $\text{ESR}_{\text{dB}}$ (440 Hz) | THD (440 Hz) | $H_2 / H_3$ (dB) | IMD 5.ª / 3.ª (dB) | $\text{ASNR}_{\text{dB}}$ (4.5 kHz) | $\text{ESR}_{\text{dB}}$ Transitorio | CPU (ns/muestra) | Latencia (muestras) |
+|---|---|---|---|---|---|---|---|---|
+| **Ground Truth `16×` NR (`48 kHz`)** | Ref. | `24.51%` | `-120.0 / -14.1` | `-13.1 / -13.3` | `80.9 dB` | Ref. | `3348.2` | `7.71` |
+| **White-Box WDF + Wright $\omega$ (`48 kHz`, `4×`)** | **`-44.1 dB`** | `24.51%` | `-120.0 / -14.1` | `-13.1 / -13.3` | `42.1 dB` | **`-63.3 dB`** | `522.8` | `5.61` |
+| **Gray-Box + `ADAA1` (`48 kHz`, `4×`)** | `-34.3 dB` | `24.13%` | `-120.0 / -14.1` | `-13.1 / -13.3` | **`62.5 dB`** | `-44.1 dB` | **`87.0`** | `5.63` |
+| **Ground Truth `16×` NR (`192 kHz`)** | Ref. | `22.14%` | `-112.5 / -14.2` | `-12.5 / -4.6` | `90.1 dB` | Ref. | `3294.5` | `7.60` |
+| **White-Box WDF + Wright $\omega$ (`192 kHz`, `1×`)** | **`-60.9 dB`** | `22.14%` | `-113.1 / -14.2` | `-12.5 / -4.6` | `33.6 dB` | **`-76.4 dB`** | `123.0` | `1.05` |
+| **Gray-Box + `ADAA1` (`192 kHz`, `1×`)** | `-34.7 dB` | `21.90%` | `-113.0 / -14.3` | `-12.5 / -4.6` | **`55.3 dB`** | `-43.5 dB` | **`14.7`** | `1.63` |
+
+![Formas de onda y error residual](./figures/d5_waveforms_and_error.svg)
+
+![Espectro de aliasing E2 a 48 kHz y 192 kHz](./figures/d5_aliasing_spectrum.svg)
+
+![Barrido de amplitud THD y ESR](./figures/d5_sweep_thd_esr.svg)
+
+#### Conclusiones objetivas del experimento `D5`
+- **Precisión frente al circuito físico (`ESR` y THD):** **White-Box WDF + Wright $\omega$** modela exactamente el acoplamiento dinámico no lineal de $C_f = 51\text{ pF}$ y logra el menor error frente al *Ground Truth* (`-44.1 dB` en `48 kHz` y `-60.9 dB` en `192 kHz`; `-63.3` / `-76.4 dB` en pulso transitorio), con una THD prácticamente indistinguible de la referencia (`24.51%` vs `24.51%`).
+- **Aliasing en agudos (`ASNR` en `4.5 kHz`):** **Gray-Box + `ADAA1`** supera al *White-Box* sin *Stateful ADAA* por **`+20.4 dB` a `48 kHz` (`62.5` vs. `42.1 dB`)** y **`+21.7 dB` a `192 kHz` a `1×` (`55.3` vs. `33.6 dB`)**. La ausencia de integración antiderivada penaliza severamente al esquema implícito cuando corre directo a `1×` en `192 kHz`.
+- **Rendimiento CPU e idoneidad para `D6`:** **Gray-Box + `ADAA1`** consume **`87.0 ns/muestra`** a `48 kHz` (`6.0×` más rápido que `White-Box`) y **`14.7 ns/muestra`** a `192 kHz` (`8.4×` más rápido), conservando idéntica respuesta de intermodulación (`IMD = -13.1 / -13.3 dB`) y armónicos (`H3 = -14.1 dB`). Por ello queda validado **Gray-Box + `ADAA1`** como motor de producción del `Overdrive` unificado de 6 perillas (`D6`).
 
 ---
 
@@ -185,11 +198,11 @@ Para comparar con rigor científico y datos reproducibles si el modelado físico
 
 ---
 
-## 5. Decisiones cerradas (`v1.1`)
+## 5. Decisiones cerradas (`v1.2`)
 
 | ID | Pedal / Tema | Opciones consideradas | Decisión final |
 |---|---|---|---|
-| **D5** | **Modelado de Overdrive (`White-Box` vs. `Gray-Box`)** | **A)** *Gray-Box* estructural calibrado + `ADAA1`<br>**B)** *White-Box* WDF + Wright $\omega$<br>**C)** Ejecutar prueba comparativa rigurosa (Sección 3.5) | ✅ **Experimento comparativo acotado (Sección 3.5):** contrastar ambos modelos frente a *Ground Truth* (`16×` NR `f64`) con gráficas y métricas (`ESR`, `THD`, `IMD`, `ASNR`, CPU) antes de fijar el ganador definitivo |
+| **D5** | **Modelado de Overdrive (`White-Box` vs. `Gray-Box`)** | **A)** *Gray-Box* estructural calibrado + `ADAA1`<br>**B)** *White-Box* WDF + Wright $\omega$<br>**C)** Ejecutar prueba comparativa rigurosa (Sección 3.5) | ✅ **Experimento completado (Sección 3.5):** **Gray-Box + `ADAA1`** gana en rechazo de aliasing (`+20.4` a `+21.7 dB` ASNR) y costo CPU (`6–8.4×` menor), quedando elegido para producción en `D6`; *White-Box WDF + Wright $\omega$* queda preservado como referencia científica en `d5_experiment.rs` |
 | **D6** | **Estructura de Overdrive en la pedalera** | **A)** Dos pedales separados<br>**B)** Un solo pedal `Overdrive` unificado | ✅ **Opción B — Overdrive único unificado (`kind = "overdrive"`):** 6 perillas continuas (`Drive`, `Pre-Cut`, `Asymmetry`, `Clean Blend`, `Tone`, `Level`) + *stacking* usando las 4 instancias múltiples del motor |
 | **D7** | **Implementación del Preamp `12AX7`** | **A)** 2–3 etapas invertidas con LUT de Koren + RC dinámico (cátodo + *grid current*) en bloque único $M(f_s)$ + `ADAA1`-LUT<br>**B)** Newton-Raphson iterativo por muestra | ✅ **Opción A** |
 | **D8** | **Alcance del `Clean Boost / Preamp`** | **A)** Todo configurable en perillas<br>**B)** Solo ganancia<br>**C)** 3 controles (`Gain`, selector `Op-Amp/JFET`, `Tilt`) + internos fijos | ✅ **Opción C:** `Gain`, selector `Mode` (`Op-Amp` / `JFET` con *crossfade*) y `Tilt`; filtro subsónico ($30\text{ Hz}$) y *headroom* ($18\text{ V}$) fijados internamente y verificados por tests |
