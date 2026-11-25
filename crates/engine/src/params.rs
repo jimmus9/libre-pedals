@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use dsp::{lin_to_db, Chain, CustomIrAsset, ParamSpec};
 
 pub const MAX_INSTANCES_PER_KIND: usize = 4;
-pub const MAX_MOUNTED_PEDALS: usize = 12;
+pub const MAX_MOUNTED_PEDALS: usize = 16;
 pub const PRESET_LEVEL_MIN_DB: f32 = -24.0;
 pub const PRESET_LEVEL_MAX_DB: f32 = 12.0;
 
@@ -755,16 +755,21 @@ mod tests {
     #[test]
     fn params_mounting_and_master_separation_keep_master_last() {
         let params = Params::default();
-        assert_eq!(params.slot_count(), 10 * MAX_INSTANCES_PER_KIND + 1);
+        assert_eq!(params.slot_count(), 15 * MAX_INSTANCES_PER_KIND + 1);
         let kinds: Vec<&str> = params.kinds().into_iter().map(|k| k.kind).collect();
         assert!(kinds.contains(&"noise_gate"));
         assert!(kinds.contains(&"wah"));
-        assert!(kinds.contains(&"clean_boost"));
         assert!(kinds.contains(&"opto_comp"));
+        assert!(kinds.contains(&"phaser"));
+        assert!(kinds.contains(&"clean_boost"));
         assert!(kinds.contains(&"overdrive"));
         assert!(kinds.contains(&"tube_preamp"));
         assert!(kinds.contains(&"parametric_eq"));
         assert!(kinds.contains(&"cabinet_ir"));
+        assert!(kinds.contains(&"chorus"));
+        assert!(kinds.contains(&"tremolo"));
+        assert!(kinds.contains(&"delay"));
+        assert!(kinds.contains(&"reverb"));
         assert!(kinds.contains(&"soft_clipper"));
         assert!(kinds.contains(&"limiter"));
         let master = params.master_slot().expect("master slot");

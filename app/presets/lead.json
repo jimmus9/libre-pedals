@@ -2,7 +2,7 @@
   "format_version": 1,
   "name": "Lead (Boost + Drive)",
   "author": "libre-pedals",
-  "description": "Klon transparente empujando a overdrive TS-808, EQ Paramétrico post-drive y gabinete 4x12 High-Gain",
+  "description": "Klon transparente empujando a TS-808, EQ Paramétrico, 4x12 High-Gain, Analog BBD Delay y Hall Reverb",
   "chain": [
     {
       "id": "noise_gate-1",
@@ -69,6 +69,32 @@
         "high_cut_hz": 7800.0,
         "mix": 100.0,
         "level_db": 0.0
+      }
+    },
+    {
+      "id": "delay-1",
+      "pedal": "delay",
+      "label": "BBD Lead Echo",
+      "enabled": true,
+      "params": {
+        "mode": 1.0,
+        "time_ms": 360.0,
+        "feedback": 32.0,
+        "tone": 45.0,
+        "mod_depth": 22.0,
+        "mix": 22.0
+      }
+    },
+    {
+      "id": "reverb-1",
+      "pedal": "reverb",
+      "enabled": true,
+      "params": {
+        "mode": 1.0,
+        "decay": 48.0,
+        "predelay_ms": 22.0,
+        "tone": 52.0,
+        "mix": 18.0
       }
     }
   ],

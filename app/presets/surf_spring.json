@@ -1,0 +1,91 @@
+{
+  "format_version": 1,
+  "name": "Surf Spring & Tremolo",
+  "author": "libre-pedals",
+  "description": "Boost limpio + Phaser suave, Tremolo Harmonic Brownface, Tape Slapback, 1x12 Clean y Spring Reverb clásico",
+  "chain": [
+    {
+      "id": "noise_gate-1",
+      "pedal": "noise_gate",
+      "enabled": true,
+      "params": {
+        "threshold_db": -62.0
+      }
+    },
+    {
+      "id": "clean_boost-1",
+      "pedal": "clean_boost",
+      "enabled": true,
+      "params": {
+        "gain_db": 5.0,
+        "mode": 1.0,
+        "tilt_db": 2.0
+      }
+    },
+    {
+      "id": "phaser-1",
+      "pedal": "phaser",
+      "enabled": true,
+      "params": {
+        "stages": 0.0,
+        "rate_hz": 0.45,
+        "depth": 58.0,
+        "feedback": 22.0,
+        "mix": 38.0
+      }
+    },
+    {
+      "id": "tremolo-1",
+      "pedal": "tremolo",
+      "label": "Brownface Harm",
+      "enabled": true,
+      "params": {
+        "mode": 1.0,
+        "rate_hz": 4.6,
+        "depth": 68.0,
+        "shape": 30.0,
+        "level_db": 0.0
+      }
+    },
+    {
+      "id": "delay-1",
+      "pedal": "delay",
+      "label": "Tape Slapback",
+      "enabled": true,
+      "params": {
+        "mode": 2.0,
+        "time_ms": 140.0,
+        "feedback": 24.0,
+        "tone": 52.0,
+        "mod_depth": 40.0,
+        "mix": 24.0
+      }
+    },
+    {
+      "id": "cabinet_ir-1",
+      "pedal": "cabinet_ir",
+      "enabled": true,
+      "params": {
+        "model": 0.0,
+        "low_cut_hz": 75.0,
+        "high_cut_hz": 9000.0,
+        "mix": 100.0,
+        "level_db": 0.0
+      }
+    },
+    {
+      "id": "reverb-1",
+      "pedal": "reverb",
+      "label": "Surf Tank",
+      "enabled": true,
+      "params": {
+        "mode": 2.0,
+        "decay": 62.0,
+        "predelay_ms": 6.0,
+        "tone": 60.0,
+        "mix": 38.0
+      }
+    }
+  ],
+  "preset_level_db": 0.0
+}

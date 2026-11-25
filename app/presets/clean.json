@@ -2,7 +2,7 @@
   "format_version": 1,
   "name": "Clean",
   "author": "libre-pedals",
-  "description": "Señal limpia con puerta de ruido avanzada e histéresis suave",
+  "description": "Señal limpia cristalina con combo 1x12 Clean y reverberación Plate sutil",
   "chain": [
     {
       "id": "noise_gate-1",
@@ -14,6 +14,30 @@
         "hold_ms": 60.0,
         "release_ms": 150.0,
         "range_db": -80.0
+      }
+    },
+    {
+      "id": "cabinet_ir-1",
+      "pedal": "cabinet_ir",
+      "enabled": true,
+      "params": {
+        "model": 0.0,
+        "low_cut_hz": 70.0,
+        "high_cut_hz": 9500.0,
+        "mix": 100.0,
+        "level_db": 0.0
+      }
+    },
+    {
+      "id": "reverb-1",
+      "pedal": "reverb",
+      "enabled": true,
+      "params": {
+        "mode": 0.0,
+        "decay": 42.0,
+        "predelay_ms": 12.0,
+        "tone": 62.0,
+        "mix": 16.0
       }
     }
   ],

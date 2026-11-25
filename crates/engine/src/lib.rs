@@ -14,9 +14,9 @@ use cpal::{
     SupportedBufferSize, SupportedStreamConfig,
 };
 use dsp::{
-    db_to_lin, BrickwallLimiter, CabinetIr, Chain, CleanBoost, Effect, Gain, NoiseGate,
-    OptoCompressor, Overdrive, ParametricEq, Resampler, ScopedNoDenormals, SoftClipTape,
-    TubePreamp, Wah,
+    db_to_lin, BrickwallLimiter, CabinetIr, Chain, Chorus, CleanBoost, Delay, Effect, Gain,
+    NoiseGate, OptoCompressor, Overdrive, ParametricEq, Phaser, Resampler, Reverb,
+    ScopedNoDenormals, SoftClipTape, Tremolo, TubePreamp, Wah,
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -473,6 +473,9 @@ pub fn default_pedalboard_chain() -> Chain {
         chain.push(OptoCompressor::new(), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(Phaser::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
         chain.push(CleanBoost::new(), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
@@ -486,6 +489,18 @@ pub fn default_pedalboard_chain() -> Chain {
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
         chain.push(CabinetIr::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(Chorus::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(Tremolo::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(Delay::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(Reverb::new(), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
         chain.push(SoftClipTape::new(), false);
@@ -1199,6 +1214,85 @@ mod tests {
                 assert!(cpu_pct < 20.0, "Release CPU budget exceeded: {cpu_pct:.2}%");
                 #[cfg(debug_assertions)]
                 assert!(cpu_pct < 98.0, "Debug CPU budget exceeded: {cpu_pct:.2}%");
+            }
+        }
+    }
+
+    #[test]
+    fn ola5_full_15_pedal_stack_latency_and_cpu_audit() {
+        let params = Params::default();
+        let gate_idx = params.first_slot_of_kind("noise_gate").unwrap().0;
+        let wah_idx = params.mount_new_instance("wah").unwrap();
+        let comp_idx = params.mount_new_instance("opto_comp").unwrap();
+        let phaser_idx = params.mount_new_instance("phaser").unwrap();
+        let boost_idx = params.mount_new_instance("clean_boost").unwrap();
+        let od_idx = params.first_slot_of_kind("overdrive").unwrap().0;
+        let tube_idx = params.mount_new_instance("tube_preamp").unwrap();
+        let eq_idx = params.mount_new_instance("parametric_eq").unwrap();
+        let cab_idx = params.mount_new_instance("cabinet_ir").unwrap();
+        let chorus_idx = params.mount_new_instance("chorus").unwrap();
+        let trem_idx = params.mount_new_instance("tremolo").unwrap();
+        let delay_idx = params.mount_new_instance("delay").unwrap();
+        let reverb_idx = params.mount_new_instance("reverb").unwrap();
+        let tape_idx = params.mount_new_instance("soft_clipper").unwrap();
+        let lim_idx = params.mount_new_instance("limiter").unwrap();
+
+        // Verifica que los 5 pedales de Ola 5 aportan 0 muestras de latencia.
+        params.set_cascade(&[chorus_idx, phaser_idx, trem_idx, delay_idx, reverb_idx]);
+        for &sr in &[48_000_u32, 96_000, 192_000] {
+            let chain = build_pedalboard_chain(&params, sr, sr);
+            assert_eq!(chain.latency_samples(), 0);
+            assert_eq!(estimate_chain_latency_samples(&params, sr), 0);
+        }
+
+        let ola4_10_pedals = [
+            gate_idx, wah_idx, comp_idx, boost_idx, od_idx, tube_idx, eq_idx, cab_idx, tape_idx,
+            lim_idx,
+        ];
+        let ola5_rig_8_pedals = [
+            gate_idx, od_idx, eq_idx, cab_idx, chorus_idx, delay_idx, reverb_idx, lim_idx,
+        ];
+        let ola5_all_15_pedals = [
+            gate_idx, wah_idx, comp_idx, phaser_idx, boost_idx, od_idx, tube_idx, eq_idx, cab_idx,
+            chorus_idx, trem_idx, delay_idx, reverb_idx, tape_idx, lim_idx,
+        ];
+        params.slots()[delay_idx].set_by_id("mode", 2.0); // Tape Delay
+        params.slots()[reverb_idx].set_by_id("mode", 0.0); // Plate Reverb
+
+        for &bench_sr in &[48_000_u32, 96_000, 192_000] {
+            for &(label, cascade) in &[
+                ("ola4_10_pedals", ola4_10_pedals.as_slice()),
+                ("ola5_rig_8_pedals", ola5_rig_8_pedals.as_slice()),
+                ("ola5_all_15_pedals", ola5_all_15_pedals.as_slice()),
+            ] {
+                params.set_cascade(cascade);
+                let mut chain = build_pedalboard_chain(&params, bench_sr, bench_sr);
+                let mut block = vec![0.0_f32; 128];
+                let total_blocks = bench_sr as usize / 128; // 1 segundo exacto en bloques de 128.
+                let t0 = std::time::Instant::now();
+                for b in 0..total_blocks {
+                    for (i, s) in block.iter_mut().enumerate() {
+                        let n = (b * 128 + i) as f32 / bench_sr as f32;
+                        *s = 0.16 * (std::f32::consts::TAU * 220.0 * n).sin();
+                    }
+                    sync_chain_from_params(&mut chain, &params, bench_sr);
+                    chain.process(&mut block);
+                    for &s in &block {
+                        assert!(s.is_finite());
+                    }
+                }
+                let cpu_pct = (t0.elapsed().as_secs_f64() / 1.0) * 100.0;
+                let lat = chain.latency_samples();
+                assert_eq!(lat, estimate_chain_latency_samples(&params, bench_sr));
+                println!(
+                    "AUDITORIA_OLA5: sr={bench_sr} stack={label} cpu_pct={cpu_pct:.2}% latency_samples={lat} latency_ms={:.2}",
+                    lat as f32 * 1000.0 / bench_sr as f32
+                );
+                #[cfg(not(debug_assertions))]
+                assert!(
+                    cpu_pct < 35.0,
+                    "Release CPU budget exceeded for {label} @ {bench_sr} Hz: {cpu_pct:.2}%"
+                );
             }
         }
     }

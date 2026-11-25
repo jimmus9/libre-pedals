@@ -3,8 +3,11 @@ use std::any::Any;
 pub mod adaa;
 pub mod analyzer;
 pub mod cabinet_ir;
+pub mod chorus;
 pub mod clean_boost;
 pub mod d5_experiment;
+pub mod delay;
+pub mod delay_line;
 pub mod denormals;
 pub mod gain;
 pub mod gate;
@@ -14,10 +17,13 @@ pub mod opto_comp;
 pub mod overdrive;
 pub mod oversampler;
 pub mod parametric_eq;
+pub mod phaser;
 pub mod resampler;
+pub mod reverb;
 pub mod smoother;
 pub mod svf;
 pub mod tape_limiter;
+pub mod tremolo;
 pub mod tube_preamp;
 pub mod wah;
 pub mod wav;
@@ -32,7 +38,10 @@ pub use analyzer::{
 pub use cabinet_ir::{
     partition_size_for_rate, CabinetIr, CustomIrAsset, PreparedIrPartitions, UpolsConvolver,
 };
+pub use chorus::Chorus;
 pub use clean_boost::CleanBoost;
+pub use delay::Delay;
+pub use delay_line::{FractionalDelayLine, OnePoleAllPassTpt, SchroederAllPass};
 pub use denormals::{flush_denormal, flush_denormal_f64, ScopedNoDenormals};
 pub use gain::Gain;
 pub use gate::NoiseGate;
@@ -42,10 +51,13 @@ pub use opto_comp::OptoCompressor;
 pub use overdrive::Overdrive;
 pub use oversampler::{adaptive_oversampling_factor, HalfBandStage2x, Oversampler};
 pub use parametric_eq::ParametricEq;
+pub use phaser::Phaser;
 pub use resampler::Resampler;
+pub use reverb::Reverb;
 pub use smoother::{ModeCrossfader, OnePoleSmoother};
 pub use svf::{SvfMode, SvfTpt};
 pub use tape_limiter::SoftClipTape;
+pub use tremolo::Tremolo;
 pub use tube_preamp::TubePreamp;
 pub use wah::Wah;
 pub use wav::WavIrData;
@@ -556,7 +568,20 @@ mod tests {
     fn no_nan_for_zeros_huge_and_nonfinite_inputs() {
         let mut chain = Chain::new();
         chain.push(NoiseGate::new(-50.0), false);
+        chain.push(Wah::new(), false);
+        chain.push(OptoCompressor::new(), false);
+        chain.push(Phaser::new(), false);
+        chain.push(CleanBoost::new(), false);
         chain.push(Overdrive::new(), false);
+        chain.push(TubePreamp::new(), false);
+        chain.push(ParametricEq::new(), false);
+        chain.push(CabinetIr::new(), false);
+        chain.push(Chorus::new(), false);
+        chain.push(Tremolo::new(), false);
+        chain.push(Delay::new(), false);
+        chain.push(Reverb::new(), false);
+        chain.push(SoftClipTape::new(), false);
+        chain.push(BrickwallLimiter::new(), false);
         chain.push(Gain::new(6.0), false);
         chain.prepare(48_000.0, 256);
 
@@ -587,9 +612,9 @@ mod tests {
         }
 
         // Cadena en bypass con ceros sigue siendo ceros.
-        chain.set_bypass(0, true);
-        chain.set_bypass(1, true);
-        chain.set_bypass(2, true);
+        for idx in 0..chain.len() {
+            chain.set_bypass(idx, true);
+        }
         let mut zeros = vec![0.0_f32; 128];
         chain.process(&mut zeros);
         assert!(zeros.iter().all(|&x| x == 0.0));
@@ -2316,5 +2341,370 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn chorus_hermite_modulation_smooth_and_bbd_warmth() {
+        let sr = 48_000.0_f32;
+        let mut ch = Chorus::new();
+        assert_eq!(ch.latency_samples(), 0);
+        ch.set_rate_hz(1.5);
+        ch.set_depth(80.0);
+        ch.set_center_ms(8.0);
+        ch.set_warmth_hz(5_000.0);
+        ch.set_mix(100.0);
+        ch.prepare(sr, 256);
+
+        // 1) Suavidad temporal sin saltos discontinuos bajo modulación Hermite en seno puro.
+        let (mut sig, _) = generate_coherent_sine(440.0, sr, 24_000, 0.35);
+        for blk in sig.chunks_mut(128) {
+            ch.process(blk);
+        }
+        let max_step = sig[4096..]
+            .windows(2)
+            .fold(0.0_f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(
+            max_step < 0.08,
+            "Chorus step discontinuity too high: max_step={max_step}"
+        );
+
+        // 2) Calidez BBD: en 14 kHz debe atenuar claramente respecto a 1 kHz.
+        let measure_rms = |c: &mut Chorus, freq: f32| -> f32 {
+            c.reset();
+            let warmup = 4096usize;
+            let n = 4096usize;
+            let (mut s, _) = generate_coherent_sine(freq, sr, warmup + n, 0.25);
+            for blk in s.chunks_mut(256) {
+                c.process(blk);
+            }
+            compute_waveform_metrics(&s[warmup..]).rms_db
+        };
+        let rms_1k = measure_rms(&mut ch, 1_000.0);
+        let rms_14k = measure_rms(&mut ch, 14_000.0);
+        assert!(
+            rms_1k - rms_14k > 10.0,
+            "Chorus BBD warmth filter too weak: 1k={rms_1k:.2}, 14k={rms_14k:.2}"
+        );
+    }
+
+    #[test]
+    fn phaser_tpt_notches_move_and_stages_crossfade() {
+        let sr = 48_000.0_f32;
+        let mut ph = Phaser::new();
+        assert_eq!(ph.latency_samples(), 0);
+        ph.set_depth(95.0);
+        ph.set_feedback(85.0);
+        ph.set_mix(50.0);
+
+        for &stages in &[0.0_f32, 1.0] {
+            ph.set_stages(stages);
+            ph.set_rate_hz(1.2);
+            ph.prepare(sr, 256);
+
+            // Estabilidad acotada incluso con feedback máximo 85% y ruido/acorde.
+            let mut probe: Vec<f32> = (0..48_000)
+                .map(|i| {
+                    let t = i as f32 / sr;
+                    0.3 * (std::f32::consts::TAU * 220.0 * t).sin()
+                        + 0.25 * (std::f32::consts::TAU * 880.0 * t).sin()
+                        + 0.2 * (std::f32::consts::TAU * 2_200.0 * t).sin()
+                })
+                .collect();
+            for blk in probe.chunks_mut(128) {
+                ph.process(blk);
+                assert!(blk.iter().all(|v| v.is_finite() && v.abs() < 2.5));
+            }
+        }
+
+        // Verifica muesca móvil profunda (> 10 dB) deteniendo LFO y barriendo un impulso desplazado.
+        ph.set_stages(0.0);
+        ph.set_rate_hz(0.08);
+        ph.set_feedback(0.0);
+        ph.set_mix(50.0);
+        ph.prepare(sr, 256);
+        let mut imp = vec![0.0_f32; 4096];
+        imp[256] = 0.8;
+        ph.process(&mut imp);
+        let mut spec = vec![-120.0_f32; 2048];
+        compute_spectrum_db(&imp, &mut spec);
+        let bin_hz = sr / 4096.0;
+        let k_lo = (150.0 / bin_hz).ceil() as usize;
+        let k_hi = (4_500.0 / bin_hz).floor() as usize;
+        let max_db = spec[k_lo..=k_hi].iter().copied().fold(-120.0_f32, f32::max);
+        let min_db = spec[k_lo..=k_hi].iter().copied().fold(0.0_f32, f32::min);
+        assert!(
+            max_db - min_db > 10.0,
+            "Phaser should create deep spectrum notches (> 10 dB): max={max_db:.2}, min={min_db:.2}"
+        );
+
+        // Conmutación en vivo 4-Stage <-> 6-Stage sin clics.
+        ph.set_rate_hz(0.8);
+        ph.prepare(sr, 64);
+        let mut sig: Vec<f32> = (0..2048)
+            .map(|i| 0.35 * (std::f32::consts::TAU * 330.0 * i as f32 / sr).sin())
+            .collect();
+        for (idx, ch) in sig.chunks_mut(64).enumerate() {
+            if idx == 8 {
+                ph.set_stages(1.0);
+            } else if idx == 20 {
+                ph.set_stages(0.0);
+            }
+            ph.process(ch);
+            assert!(ch.iter().all(|v| v.is_finite()));
+        }
+        let max_jump = sig
+            .windows(2)
+            .fold(0.0_f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(max_jump < 0.08, "Phaser stage switch jump: {max_jump}");
+    }
+
+    #[test]
+    fn tremolo_optical_depth_and_harmonic_allpass_crossover() {
+        let sr = 48_000.0_f32;
+        let mut tr = Tremolo::new();
+        assert_eq!(tr.latency_samples(), 0);
+
+        // 1) Harmonic con Depth = 0% debe sumar a magnitud plana (±0.25 dB) gracias al crossover LR2.
+        tr.set_mode(1.0);
+        tr.set_depth(0.0);
+        tr.set_level_db(0.0);
+        tr.prepare(sr, 256);
+        for &f in &[150.0_f32, 700.0, 2_800.0, 7_500.0] {
+            tr.reset();
+            let warmup = 4096usize;
+            let n = 4096usize;
+            let (s_in, _) = generate_coherent_sine(f, sr, warmup + n, 0.4);
+            let mut s_out = s_in.clone();
+            tr.process(&mut s_out);
+            let diff = (compute_waveform_metrics(&s_out[warmup..]).rms_db
+                - compute_waveform_metrics(&s_in[warmup..]).rms_db)
+                .abs();
+            assert!(
+                diff < 0.25,
+                "Harmonic crossover magnitude error at {f} Hz with 0% depth: {diff:.3} dB"
+            );
+        }
+
+        // 2) Harmonic con Depth = 90%: envolvente de graves (200 Hz) y agudos (2.5 kHz) en contrafase.
+        tr.set_rate_hz(4.0);
+        tr.set_depth(90.0);
+        tr.prepare(sr, 256);
+        let half_period = (0.5 * sr / 4.0) as usize; // t0 vs t0 + T/2
+        let (mut s_lo, _) = generate_coherent_sine(200.0, sr, 48_000, 0.5);
+        tr.process(&mut s_lo);
+        tr.reset();
+        let (mut s_hi, _) = generate_coherent_sine(2_500.0, sr, 48_000, 0.5);
+        tr.process(&mut s_hi);
+
+        let w = 1024usize;
+        let lo_q1 = compute_waveform_metrics(&s_lo[3000..3000 + w]).rms_db;
+        let lo_q2 =
+            compute_waveform_metrics(&s_lo[3000 + half_period..3000 + half_period + w]).rms_db;
+        let hi_q1 = compute_waveform_metrics(&s_hi[3000..3000 + w]).rms_db;
+        let hi_q2 =
+            compute_waveform_metrics(&s_hi[3000 + half_period..3000 + half_period + w]).rms_db;
+        assert!(
+            (lo_q1 - lo_q2) * (hi_q1 - hi_q2) < -10.0,
+            "Harmonic bands should modulate in opposite phase: lo=({lo_q1:.2}, {lo_q2:.2}), hi=({hi_q1:.2}, {hi_q2:.2})"
+        );
+
+        // 3) Modo Optical genera modulación de amplitud profunda (> 8 dB swing).
+        tr.set_mode(0.0);
+        tr.prepare(sr, 256);
+        let (mut s_opt, _) = generate_coherent_sine(440.0, sr, 48_000, 0.5);
+        tr.process(&mut s_opt);
+        let opt_q1 = compute_waveform_metrics(&s_opt[3000..3000 + w]).rms_db;
+        let opt_q2 =
+            compute_waveform_metrics(&s_opt[3000 + half_period..3000 + half_period + w]).rms_db;
+        assert!(
+            (opt_q1 - opt_q2).abs() > 8.0,
+            "Optical tremolo modulation too weak: {opt_q1:.2} vs {opt_q2:.2}"
+        );
+    }
+
+    #[test]
+    fn delay_digital_bbd_tape_progressive_darkening_and_glide() {
+        let sr = 48_000.0_f32;
+        let mut d = Delay::new();
+        assert_eq!(d.latency_samples(), 0);
+
+        // 1) Verifica eco discreto en Time=60 ms (2880 muestras) y oscurecimiento BBD/Tape > Digital.
+        let measure_echo_hf_drop = |mode: f32| -> (f32, f32) {
+            let mut del = Delay::new();
+            del.set_mode(mode);
+            del.set_time_ms(60.0);
+            del.set_feedback(65.0);
+            del.set_tone(45.0);
+            del.set_mod_depth(0.0);
+            del.set_mix(100.0);
+            del.prepare(sr, 256);
+
+            // Inyecta ráfaga breve de dos tonos (250 Hz + 3500 Hz) durante 20 ms y observa echo #1 y #3.
+            let len = 14_400usize; // 300 ms
+            let mut buf = vec![0.0_f32; len];
+            for (i, dst) in buf[..960].iter_mut().enumerate() {
+                let t = i as f32 / sr;
+                let win = 0.5 * (1.0 - (std::f32::consts::TAU * i as f32 / 960.0).cos());
+                *dst = win
+                    * 0.35
+                    * ((std::f32::consts::TAU * 250.0 * t).sin()
+                        + (std::f32::consts::TAU * 3_500.0 * t).sin());
+            }
+            for blk in buf.chunks_mut(256) {
+                del.process(blk);
+            }
+            let echo_rms = |echo_num: usize| -> (f32, f32) {
+                let start = echo_num * 2880;
+                let slice = &buf[start..start + 1024];
+                let mut spec = vec![-120.0_f32; 512];
+                compute_spectrum_db(slice, &mut spec);
+                let bin_hz = sr / 1024.0;
+                let k_lo = (250.0 / bin_hz).round() as usize;
+                let k_hi = (3_500.0 / bin_hz).round() as usize;
+                (spec[k_lo], spec[k_hi])
+            };
+            let (e1_lo, e1_hi) = echo_rms(1);
+            let (e3_lo, e3_hi) = echo_rms(3);
+            let drop_hi_vs_lo_echo3 = (e3_lo - e3_hi) - (e1_lo - e1_hi);
+            (e1_lo, drop_hi_vs_lo_echo3)
+        };
+
+        let (dig_e1, dig_drop) = measure_echo_hf_drop(0.0);
+        let (bbd_e1, bbd_drop) = measure_echo_hf_drop(1.0);
+        let (tape_e1, tape_drop) = measure_echo_hf_drop(2.0);
+        assert!(dig_e1 > -35.0 && bbd_e1 > -35.0 && tape_e1 > -35.0);
+        assert!(
+            bbd_drop > dig_drop + 4.0,
+            "Analog BBD should darken repeats faster than Digital: bbd_drop={bbd_drop:.2}, dig_drop={dig_drop:.2}"
+        );
+        assert!(
+            tape_drop > dig_drop + 3.0,
+            "Tape Delay should darken repeats faster than Digital: tape_drop={tape_drop:.2}, dig_drop={dig_drop:.2}"
+        );
+
+        // 2) Deslizamiento continuo de Time sin clics + estabilidad acotada con Feedback 95%.
+        d.set_mode(2.0);
+        d.set_time_ms(120.0);
+        d.set_feedback(95.0);
+        d.set_mix(50.0);
+        d.prepare(sr, 64);
+        let mut glide_buf = vec![0.0_f32; 16_384];
+        for (i, dst) in glide_buf.iter_mut().enumerate() {
+            let t = i as f32 / sr;
+            *dst = 0.25 * (std::f32::consts::TAU * 330.0 * t).sin();
+        }
+        for (blk_i, blk) in glide_buf.chunks_mut(64).enumerate() {
+            if blk_i == 40 {
+                d.set_time_ms(320.0);
+            }
+            d.process(blk);
+            assert!(blk.iter().all(|v| v.is_finite() && v.abs() < 3.0));
+        }
+        let max_jump = glide_buf
+            .windows(2)
+            .fold(0.0_f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(max_jump < 0.25, "Delay time glide click: {max_jump}");
+    }
+
+    #[test]
+    fn reverb_plate_hall_spring_energy_stability_denormals_and_dispersion() {
+        // 1) Estabilidad energética con Decay = 100% y decaimiento sin NaN/denormals en 48k y 192k.
+        for &sr in &[48_000.0_f32, 192_000.0] {
+            for &mode in &[0.0_f32, 1.0, 2.0] {
+                let mut rev = Reverb::new();
+                assert_eq!(rev.latency_samples(), 0);
+                rev.set_mode(mode);
+                rev.set_decay(100.0);
+                rev.set_predelay_ms(20.0);
+                rev.set_tone(65.0);
+                rev.set_mix(100.0);
+                rev.prepare(sr, 256);
+
+                let burst_len = (0.15 * sr) as usize;
+                let tail_len = (1.5 * sr) as usize;
+                let mut burst = vec![0.0_f32; burst_len];
+                for (i, dst) in burst.iter_mut().enumerate() {
+                    let t = i as f32 / sr;
+                    *dst = 0.5
+                        * ((std::f32::consts::TAU * 220.0 * t).sin()
+                            + 0.6 * (std::f32::consts::TAU * 1_100.0 * t).sin());
+                }
+                for blk in burst.chunks_mut(256) {
+                    rev.process(blk);
+                }
+                let early_tail_rms = compute_waveform_metrics(&burst[burst_len - 512..]).rms;
+
+                let mut tail = vec![0.0_f32; tail_len];
+                for blk in tail.chunks_mut(256) {
+                    rev.process(blk);
+                    assert!(blk.iter().all(|v| v.is_finite() && v.abs() < 4.0));
+                }
+                let end_tail_rms = compute_waveform_metrics(&tail[tail_len - 1024..]).rms;
+                assert!(
+                    end_tail_rms < early_tail_rms.max(0.05) * 1.05,
+                    "Reverb mode {mode} @ {sr} Hz must not blow up with Decay=100%: early={early_tail_rms}, end={end_tail_rms}"
+                );
+            }
+        }
+
+        // 2) Dispersión de grupo característica en Spring: banda 3–4.2 kHz llega posterior a 250–600 Hz.
+        let sr = 48_000.0_f32;
+        let mut spring = Reverb::new();
+        spring.set_mode(2.0);
+        spring.set_decay(65.0);
+        spring.set_predelay_ms(0.0);
+        spring.set_tone(90.0);
+        spring.set_mix(100.0);
+        spring.prepare(sr, 256);
+
+        let n_imp = 2048usize;
+        let mut imp = vec![0.0_f32; n_imp];
+        imp[0] = 0.8;
+        spring.process(&mut imp);
+
+        // Filtra respuesta al impulso de Spring en banda grave (250–600 Hz) y banda dispersiva (3–4.2 kHz)
+        // y calcula centroide temporal de energía (donde solo cae la cascada dispersiva del primer viaje).
+        let energy_centroid_samples = |lo_hz: f32, hi_hz: f32| -> f64 {
+            let mut hp = SvfTpt::new(sr);
+            let mut lp = SvfTpt::new(sr);
+            hp.set_params(SvfMode::HighPass, lo_hz, 0.707, 0.0);
+            lp.set_params(SvfMode::LowPass, hi_hz, 0.707, 0.0);
+            let mut num = 0.0_f64;
+            let mut den = 0.0_f64;
+            // Primer rebote (primeros ~25 ms = 1200 muestras).
+            for (i, &x) in imp[..1200].iter().enumerate() {
+                let bp = lp.process_sample(hp.process_sample(x));
+                let e = (bp as f64) * (bp as f64);
+                num += (i as f64) * e;
+                den += e;
+            }
+            num / den.max(1e-18)
+        };
+        let t_low = energy_centroid_samples(250.0, 600.0);
+        let t_high = energy_centroid_samples(3_000.0, 4_200.0);
+        assert!(
+            t_high > t_low + 40.0,
+            "Spring dispersive all-pass must delay 3-4.2 kHz vs 250-600 Hz: t_low={t_low:.1}, t_high={t_high:.1}"
+        );
+
+        // 3) Conmutación sin clics Plate -> Hall -> Spring.
+        let mut rev = Reverb::new();
+        rev.prepare(sr, 64);
+        let mut sig: Vec<f32> = (0..4096)
+            .map(|i| 0.3 * (std::f32::consts::TAU * 330.0 * i as f32 / sr).sin())
+            .collect();
+        for (idx, blk) in sig.chunks_mut(64).enumerate() {
+            if idx == 10 {
+                rev.set_mode(1.0);
+            } else if idx == 30 {
+                rev.set_mode(2.0);
+            }
+            rev.process(blk);
+            assert!(blk.iter().all(|v| v.is_finite()));
+        }
+        let max_jump = sig
+            .windows(2)
+            .fold(0.0_f32, |m, w| m.max((w[1] - w[0]).abs()));
+        assert!(max_jump < 0.15, "Reverb mode switch click: {max_jump}");
     }
 }

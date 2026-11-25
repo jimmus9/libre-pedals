@@ -1,0 +1,78 @@
+{
+  "format_version": 1,
+  "name": "80s Chorus Clean",
+  "author": "libre-pedals",
+  "description": "Limpio ochentero con compresor óptico, Chorus BBD analógico, 1x12 Clean, Digital Delay y Hall amplio",
+  "chain": [
+    {
+      "id": "noise_gate-1",
+      "pedal": "noise_gate",
+      "enabled": true,
+      "params": {
+        "threshold_db": -64.0
+      }
+    },
+    {
+      "id": "opto_comp-1",
+      "pedal": "opto_comp",
+      "enabled": true,
+      "params": {
+        "peak_reduction": 48.0,
+        "gain_db": 4.0,
+        "mode": 0.0,
+        "mix": 80.0
+      }
+    },
+    {
+      "id": "chorus-1",
+      "pedal": "chorus",
+      "label": "CE-2 Lush",
+      "enabled": true,
+      "params": {
+        "rate_hz": 0.72,
+        "depth": 65.0,
+        "center_ms": 8.2,
+        "warmth_hz": 7200.0,
+        "mix": 52.0
+      }
+    },
+    {
+      "id": "cabinet_ir-1",
+      "pedal": "cabinet_ir",
+      "enabled": true,
+      "params": {
+        "model": 0.0,
+        "low_cut_hz": 70.0,
+        "high_cut_hz": 9800.0,
+        "mix": 100.0,
+        "level_db": 0.0
+      }
+    },
+    {
+      "id": "delay-1",
+      "pedal": "delay",
+      "enabled": true,
+      "params": {
+        "mode": 0.0,
+        "time_ms": 420.0,
+        "feedback": 36.0,
+        "tone": 68.0,
+        "mod_depth": 18.0,
+        "mix": 26.0
+      }
+    },
+    {
+      "id": "reverb-1",
+      "pedal": "reverb",
+      "enabled": true,
+      "params": {
+        "mode": 1.0,
+        "decay": 64.0,
+        "predelay_ms": 24.0,
+        "tone": 58.0,
+        "mix": 30.0
+      }
+    }
+  ],
+  "preset_level_db": 0.0
+}

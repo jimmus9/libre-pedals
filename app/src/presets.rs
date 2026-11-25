@@ -5,6 +5,10 @@ use anyhow::{bail, Context, Result};
 use engine::Preset;
 
 pub const FACTORY: &[(&str, &str)] = &[
+    (
+        "80s Chorus Clean",
+        include_str!("../presets/chorus_clean.json"),
+    ),
     ("Clean", include_str!("../presets/clean.json")),
     (
         "Clean Comp (Opto + Limiter)",
@@ -16,6 +20,10 @@ pub const FACTORY: &[(&str, &str)] = &[
         include_str!("../presets/funk_wah.json"),
     ),
     ("Lead (Boost + Drive)", include_str!("../presets/lead.json")),
+    (
+        "Surf Spring & Tremolo",
+        include_str!("../presets/surf_spring.json"),
+    ),
     (
         "Tube Stack (Boost + 12AX7)",
         include_str!("../presets/tube_stack.json"),

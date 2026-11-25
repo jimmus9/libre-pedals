@@ -2,7 +2,7 @@
   "format_version": 1,
   "name": "Crunch",
   "author": "libre-pedals",
-  "description": "Overdrive moderado estilo TS/Bluesbreaker con gabinete 2x12 Crunch",
+  "description": "Overdrive moderado estilo TS/Bluesbreaker con gabinete 2x12 Crunch y Spring sutil",
   "chain": [
     {
       "id": "noise_gate-1",
@@ -35,6 +35,18 @@
         "high_cut_hz": 8200.0,
         "mix": 100.0,
         "level_db": 0.0
+      }
+    },
+    {
+      "id": "reverb-1",
+      "pedal": "reverb",
+      "enabled": true,
+      "params": {
+        "mode": 2.0,
+        "decay": 36.0,
+        "predelay_ms": 10.0,
+        "tone": 52.0,
+        "mix": 15.0
       }
     }
   ],

@@ -1,6 +1,6 @@
 # Capítulo 4 — Filtros, Gabinete (IR), Modulación, Delay y Reverb
 
-> **Estado:** ✅ Cerrado (`v1.2` — **Ola 4 implementada y auditada**; Modulación y Tiempo listos para Ola 5; `D13` Opción B, `D14`–`D17` Opción A).  
+> **Estado:** ✅ Cerrado (`v1.3` — **Capítulo 4 completamente implementado y auditado: Olas 4 y 5 cerradas**; `D13` Opción B, `D14`–`D17` Opción A).  
 > **Pedales cubiertos:** EQ Paramétrico *(4 bandas)* · Wah / Auto-Wah · Simulador de Gabinete (*Cabinet IR* por convolución) · Chorus, Phaser y Tremolo · Delay (*Digital / Analógico BBD / Tape*) · Reverb (*Plate / Hall / Spring*).  
 > **Base previa aplicada:** fórmulas *matched* de Vicanek/Orfanidis sin *cramping* para EQ en todas las $f_s$ (`D2`), filtros modulables Cytomic SVF-TPT (`D2`), selectores `Stepped` con *crossfade* ($5\text{–}10\text{ ms}$), acumulación `f64` (`D3`) y protección FTZ/DAZ contra *denormals*.
 
@@ -174,4 +174,30 @@ Medición real sobre 2 segundos de audio en bloques de `128` muestras incluyendo
 | **Ola 3 + Ola 4 (10 pedales simultáneos):** `+ Wah + Parametric EQ + Cabinet IR (UPOLS)` | **`6.21%`** (`+0.47%`) | `128` m (`2.67 ms`) | **`7.71%`** (`+1.69%`) | `248` m (`2.58 ms`) |
 | **Aporte incremental de Ola 4 (`Wah + Parametric EQ + Cabinet IR`):** *(diferencia medida vs. Ola 3)* | `+0.47%` | **`0` m (`0.00 ms`)** | `+1.69%` | **`0` m (`0.00 ms`)** |
 
-> **Conclusión de ingeniería:** Sumar **EQ Paramétrico + Wah + Cabinet IR (`UPOLS`)** añade **`0.00 ms` de latencia algorítmica** y menos de **`0.5%`–`1.7%` de CPU** en `--release` a `48–96 kHz`, manteniendo amplio margen de tiempo real antes de incorporar Modulación y Tiempo en la **Ola 5**.
+> **Conclusión de ingeniería (Ola 4):** Sumar **EQ Paramétrico + Wah + Cabinet IR (`UPOLS`)** añade **`0.00 ms` de latencia algorítmica** y menos de **`0.5%`–`1.7%` de CPU** en `--release` a `48–96 kHz`, manteniendo amplio margen de tiempo real antes de incorporar Modulación y Tiempo en la **Ola 5**.
+
+---
+
+## 10. Verificación Experimental y Auditoría del Stack Completo (Ola 5 — `v1.3`)
+
+Métricas reales medidas tras implementar **Chorus** (`chorus.rs`), **Phaser** (`phaser.rs`), **Tremolo** (`tremolo.rs`), **Delay** (`delay.rs`) y **Reverb** (`reverb.rs`) apoyados en [`delay_line.rs`](../../crates/dsp/src/delay_line.rs) (`FractionalDelayLine`, `OnePoleAllPassTpt`, `SchroederAllPass`):
+
+### 10.1 Propiedades Matemáticas Verificadas (Ola 5)
+- **Chorus BBD (`Hermite`):** interpolación cúbica continua sin saltos en frecuencia modulada (`max_step < 0.08` @ `440 Hz`, `80% Depth`) y atenuación BBD `> 10 dB` a `14 kHz` frente a `1 kHz`.
+- **Phaser (`4-Stage / 6-Stage` TPT):** muescas espectrales profundas (`> 10 dB`) desplazándose exponencialmente, estabilidad acotada con `Feedback = 85%` y conmutación entre etapas sin clics (`5 ms`).
+- **Tremolo (`Optical / Harmonic`):** *crossover* Linkwitz-Riley de 2.º orden (`LP - HP` con `Q = 0.5` @ `700 Hz`) plano dentro de `±0.25 dB` (`150 Hz–7.5 kHz`) en reposo, y modulación en contrafase (`200 Hz` vs `2.5 kHz`) en modo `Harmonic`.
+- **Delay (`Digital / Analog BBD / Tape`):** oscurecimiento progresivo medido entre eco #1 y eco #3 en `Analog BBD` (`+4 dB` caída HF respecto a `Digital`) y `Tape` (`+3 dB` caída HF), deslizamiento continuo sin clics al automatizar `Time` y estabilidad con `Feedback = 95%`.
+- **Reverb (`Plate / Hall / Spring`):** estabilidad energética y ausencia de `NaN`/*denormals* con `Decay = 100%` tanto a `48 kHz` como a `192 kHz`; en modo `Spring`, la cascada dispersiva de 16 *all-pass* de 2.º orden (`~3.65 kHz`) retrasa claramente el centroide temporal de `3–4.2 kHz` (`> +40` muestras a `48 kHz`) respecto a `250–600 Hz`, generando el ataque elástico característico.
+
+### 10.2 Auditoría de Latencia y `% CPU` de las 15 Familias (`48–192 kHz`, `--release`)
+Medición real con `cargo test --release -p engine -- --nocapture` en bloques de `128` muestras:
+- **Latencia algorítmica de Ola 5 (`Chorus`, `Phaser`, `Tremolo`, `Delay`, `Reverb`):** **`0` muestras (`0.00 ms`)** en todas las frecuencias de muestreo (`48–192 kHz`).
+- **Latencia total de cualquier cadena activa:** proviene exclusivamente de `NoiseGate` (`1.00 ms`) y `BrickwallLimiter` (`1.50 ms` + `8` muestras FIR *True-Peak* por debajo de `176.4 kHz`; `0` muestras FIR a `192 kHz`).
+
+| Configuración del *Stack* | `48 kHz` `% CPU` | `48 kHz` Latencia Stack | `96 kHz` `% CPU` | `96 kHz` Latencia Stack | `192 kHz` `% CPU` | `192 kHz` Latencia Stack |
+|---|---|---|---|---|---|---|
+| **Ola 4 (10 pedales):** sin modulación/tiempo | `6.57%` | `128` m (`2.67 ms`) | `8.73%` | `248` m (`2.58 ms`) | `12.97%` | `480` m (`2.50 ms`) |
+| **Rig completo de Ola 5 (8 pedales):** `Gate + OD + EQ + Cab IR + Chorus + Tape Delay + Plate Reverb + Limiter` | **`3.66%`** | `128` m (`2.67 ms`) | **`6.01%`** | `248` m (`2.58 ms`) | **`12.02%`** | `480` m (`2.50 ms`) |
+| **Todas las 15 familias activas a la vez:** (`Gate` -> `Wah` -> `Opto` -> `Phaser` -> `Boost` -> `OD` -> `12AX7` -> `EQ` -> `Cab IR` -> `Chorus` -> `Tremolo` -> `Tape Delay` -> `Plate Reverb` -> `Tape` -> `Limiter`) | **`8.25%`** | `128` m (`2.67 ms`) | **`10.97%`** | `248` m (`2.58 ms`) | **`17.77%`** | `480` m (`2.50 ms`) |
+
+> **Conclusión de ingeniería (Ola 5):** Un rig completo en vivo consume apenas **`3.66%` de un núcleo a `48 kHz`** (`12.02%` incluso a `192 kHz`), e incluso activando simultáneamente las **15 familias DSP completas** se mantiene en **`8.25%` (`48 kHz`) / `17.77%` (`192 kHz`)** sin añadir ni una sola muestra de latencia algorítmica sobre Ola 3.
