@@ -2,7 +2,7 @@
   "format_version": 1,
   "name": "Lead (Boost + Drive)",
   "author": "libre-pedals",
-  "description": "Doble overdrive en cascada: Boost empujando a Drive",
+  "description": "Klon transparente empujando a overdrive enfocado en medios estilo TS-808",
   "chain": [
     {
       "id": "noise_gate-1",
@@ -15,21 +15,27 @@
     {
       "id": "overdrive-1",
       "pedal": "overdrive",
-      "label": "Boost",
+      "label": "Transparent Boost",
       "enabled": true,
       "params": {
-        "drive_db": 4.0,
-        "tone_hz": 7000.0,
-        "level_db": 6.0
+        "drive_db": 6.0,
+        "low_cut_hz": 85.0,
+        "asymmetry": 10.0,
+        "clean_blend": 45.0,
+        "tone_hz": 6800.0,
+        "level_db": 4.0
       }
     },
     {
       "id": "overdrive-2",
       "pedal": "overdrive",
-      "label": "Drive",
+      "label": "Lead Drive",
       "enabled": true,
       "params": {
         "drive_db": 26.0,
+        "low_cut_hz": 720.0,
+        "asymmetry": 55.0,
+        "clean_blend": 0.0,
         "tone_hz": 4200.0,
         "level_db": -14.0
       }

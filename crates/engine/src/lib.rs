@@ -13,7 +13,10 @@ use cpal::{
     BufferSize, Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
     SupportedBufferSize, SupportedStreamConfig,
 };
-use dsp::{db_to_lin, Chain, Effect, Gain, NoiseGate, Overdrive, Resampler, ScopedNoDenormals};
+use dsp::{
+    db_to_lin, Chain, CleanBoost, Effect, Gain, NoiseGate, Overdrive, Resampler, ScopedNoDenormals,
+    TubePreamp,
+};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 pub use devices::{list_devices, ConfigSummary, DeviceReport, HostKind, HostReport};
@@ -469,7 +472,13 @@ pub fn default_pedalboard_chain() -> Chain {
         chain.push(NoiseGate::new(-60.0), false);
     }
     for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(CleanBoost::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
         chain.push(Overdrive::new(), false);
+    }
+    for _ in 0..MAX_INSTANCES_PER_KIND {
+        chain.push(TubePreamp::new(), false);
     }
     chain.push(Gain::new(-6.0), false);
     chain

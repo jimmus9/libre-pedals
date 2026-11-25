@@ -350,4 +350,32 @@ mod tests {
         let err = Preset::from_json(json).expect_err("debe fallar versión futura");
         assert!(err.to_string().contains("99"));
     }
+
+    #[test]
+    fn legacy_3knob_overdrive_preset_applies_without_warnings() {
+        let legacy_json = r#"{
+            "format_version": 1,
+            "name": "Legacy Stage 1",
+            "chain": [
+                {
+                    "id": "overdrive-1",
+                    "pedal": "overdrive",
+                    "enabled": true,
+                    "params": {
+                        "drive_db": 18.0,
+                        "tone_hz": 3200.0,
+                        "level_db": -5.0
+                    }
+                }
+            ],
+            "preset_level_db": 0.0
+        }"#;
+        let parsed = Preset::from_json(legacy_json).expect("parse legacy json");
+        let params = Params::default();
+        let warnings = parsed.apply(&params);
+        assert!(warnings.is_empty(), "warnings inesperados: {warnings:?}");
+        assert!((params.drive_db() - 18.0).abs() < 1e-4);
+        assert!((params.tone_hz() - 3200.0).abs() < 1.0);
+        assert!((params.level_db() - (-5.0)).abs() < 1e-4);
+    }
 }

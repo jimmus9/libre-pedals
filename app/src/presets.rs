@@ -8,6 +8,10 @@ pub const FACTORY: &[(&str, &str)] = &[
     ("Clean", include_str!("../presets/clean.json")),
     ("Crunch", include_str!("../presets/crunch.json")),
     ("Lead (Boost + Drive)", include_str!("../presets/lead.json")),
+    (
+        "Tube Stack (Boost + 12AX7)",
+        include_str!("../presets/tube_stack.json"),
+    ),
 ];
 
 pub fn app_data_dir() -> PathBuf {

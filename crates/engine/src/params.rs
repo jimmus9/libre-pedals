@@ -164,6 +164,19 @@ impl PedalParamSlot {
         }
     }
 
+    pub fn get_by_id(&self, id: &str) -> Option<f32> {
+        self.specs
+            .iter()
+            .position(|sp| sp.id == id)
+            .map(|idx| self.get(idx))
+    }
+
+    pub fn set_by_id(&self, id: &str, val: f32) {
+        if let Some(idx) = self.specs.iter().position(|sp| sp.id == id) {
+            self.set(idx, val);
+        }
+    }
+
     pub fn reset_defaults(&self) {
         for (spec, atom) in self.specs.iter().zip(self.values.iter()) {
             atom.store(spec.default);
@@ -256,7 +269,10 @@ impl Params {
                     is_master,
                     values: values.into_boxed_slice(),
                     bypass: AtomicBool::new(*bypass),
-                    mounted: AtomicBool::new(instance == 1),
+                    mounted: AtomicBool::new(
+                        instance == 1
+                            && matches!(kind, "noise_gate" | "overdrive" | "master_volume"),
+                    ),
                     label: Mutex::new(String::new()),
                 });
                 order.push(AtomicUsize::new(idx));
@@ -539,32 +555,35 @@ impl Params {
 
     pub fn set_drive_db(&self, db: f32) {
         if let Some((_, s)) = self.first_slot_of_kind("overdrive") {
-            s.set(0, db);
+            s.set_by_id("drive_db", db);
         }
     }
     pub fn drive_db(&self) -> f32 {
         self.first_slot_of_kind("overdrive")
-            .map_or(12.0, |(_, s)| s.get(0))
+            .and_then(|(_, s)| s.get_by_id("drive_db"))
+            .unwrap_or(14.0)
     }
 
     pub fn set_tone_hz(&self, hz: f32) {
         if let Some((_, s)) = self.first_slot_of_kind("overdrive") {
-            s.set(1, hz);
+            s.set_by_id("tone_hz", hz);
         }
     }
     pub fn tone_hz(&self) -> f32 {
         self.first_slot_of_kind("overdrive")
-            .map_or(4_000.0, |(_, s)| s.get(1))
+            .and_then(|(_, s)| s.get_by_id("tone_hz"))
+            .unwrap_or(4_000.0)
     }
 
     pub fn set_level_db(&self, db: f32) {
         if let Some((_, s)) = self.first_slot_of_kind("overdrive") {
-            s.set(2, db);
+            s.set_by_id("level_db", db);
         }
     }
     pub fn level_db(&self) -> f32 {
         self.first_slot_of_kind("overdrive")
-            .map_or(-6.0, |(_, s)| s.get(2))
+            .and_then(|(_, s)| s.get_by_id("level_db"))
+            .unwrap_or(-6.0)
     }
 
     pub fn set_gate_threshold_db(&self, db: f32) {
@@ -690,7 +709,12 @@ mod tests {
     #[test]
     fn params_mounting_and_master_separation_keep_master_last() {
         let params = Params::default();
-        assert_eq!(params.slot_count(), 2 * MAX_INSTANCES_PER_KIND + 1);
+        assert_eq!(params.slot_count(), 4 * MAX_INSTANCES_PER_KIND + 1);
+        let kinds: Vec<&str> = params.kinds().into_iter().map(|k| k.kind).collect();
+        assert!(kinds.contains(&"noise_gate"));
+        assert!(kinds.contains(&"clean_boost"));
+        assert!(kinds.contains(&"overdrive"));
+        assert!(kinds.contains(&"tube_preamp"));
         let master = params.master_slot().expect("master slot");
         assert_eq!(master.name, "Master Volume");
         assert_eq!(master.kind, "master_volume");

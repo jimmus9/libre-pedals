@@ -2,6 +2,7 @@ use std::any::Any;
 
 pub mod adaa;
 pub mod analyzer;
+pub mod clean_boost;
 pub mod d5_experiment;
 pub mod denormals;
 pub mod gain;
@@ -12,6 +13,7 @@ pub mod oversampler;
 pub mod resampler;
 pub mod smoother;
 pub mod svf;
+pub mod tube_preamp;
 
 pub use adaa::{AsymSoftClipAdaa1, HalfSampleDelay, TanhAdaa1};
 pub use analyzer::{
@@ -20,6 +22,7 @@ pub use analyzer::{
     find_rising_zero_crossing, generate_coherent_sine, HarmonicMetrics, WaveformMetrics,
     WindowKind,
 };
+pub use clean_boost::CleanBoost;
 pub use denormals::{flush_denormal, flush_denormal_f64, ScopedNoDenormals};
 pub use gain::Gain;
 pub use gate::NoiseGate;
@@ -29,6 +32,7 @@ pub use oversampler::{adaptive_oversampling_factor, HalfBandStage2x, Oversampler
 pub use resampler::Resampler;
 pub use smoother::{ModeCrossfader, OnePoleSmoother};
 pub use svf::{SvfMode, SvfTpt};
+pub use tube_preamp::TubePreamp;
 
 /// Conversión de decibelios a ganancia lineal. Valores <= -120 dB se tratan como silencio.
 #[inline]
@@ -640,13 +644,19 @@ mod tests {
 
         let mut od = Overdrive::new();
         assert_eq!(od.name(), "Overdrive");
-        assert_eq!(od.params().len(), 3);
+        assert_eq!(od.params().len(), 6);
         od.set_param(0, 24.0);
-        od.set_param(1, 3_500.0);
-        od.set_param(2, -3.0);
+        od.set_param(1, 720.0);
+        od.set_param(2, 65.0);
+        od.set_param(3, 25.0);
+        od.set_param(4, 3_500.0);
+        od.set_param(5, -3.0);
         assert!((od.get_param(0) - 24.0).abs() < 1e-6);
-        assert!((od.get_param(1) - 3_500.0).abs() < 1e-3);
-        assert!((od.get_param(2) - (-3.0)).abs() < 1e-6);
+        assert!((od.get_param(1) - 720.0).abs() < 1e-2);
+        assert!((od.get_param(2) - 65.0).abs() < 1e-6);
+        assert!((od.get_param(3) - 25.0).abs() < 1e-6);
+        assert!((od.get_param(4) - 3_500.0).abs() < 1e-3);
+        assert!((od.get_param(5) - (-3.0)).abs() < 1e-6);
 
         let mut gain = Gain::new(-6.0);
         assert_eq!(gain.name(), "Master Volume");
@@ -966,6 +976,381 @@ mod tests {
         assert!(
             (esr - (-20.0)).abs() < 0.05,
             "expected -20 dB ESR, got {esr}"
+        );
+    }
+
+    #[test]
+    fn clean_boost_opamp_thd_subsonic_headroom_and_jfet_h2() {
+        const WARMUP: usize = 2048;
+        const N: usize = 4096;
+        let sr = 48_000.0_f32;
+
+        // 1) Op-Amp lineal: THD < -80 dB y caída subsónica en Mi grave (82.41 Hz) < 0.1 dB.
+        let mut boost = CleanBoost::new();
+        boost.prepare(sr, 256);
+        boost.set_gain_db(6.0);
+        boost.set_mode(0.0);
+        boost.set_tilt_db(0.0);
+
+        let (sine_1k, f_1k) = generate_coherent_sine(1_000.0, sr, WARMUP + N, 0.25);
+        let mut out_1k = sine_1k.clone();
+        for chunk in out_1k.chunks_mut(256) {
+            boost.process(chunk);
+        }
+        let m_op = compute_harmonic_metrics(
+            &out_1k[WARMUP..],
+            sr,
+            WindowKind::BlackmanHarris4,
+            Some(f_1k),
+        );
+        assert!(
+            m_op.thd_db < -80.0,
+            "Op-Amp boost THD too high: {} dB",
+            m_op.thd_db
+        );
+
+        // Mi grave 82.41 Hz vs 1 kHz con ganancia 0 dB -> caída < 0.1 dB.
+        boost.reset();
+        boost.set_gain_db(0.0);
+        let (low_e, _) = generate_coherent_sine(82.41, sr, WARMUP + N, 0.2);
+        let (mid_ref, _) = generate_coherent_sine(1_000.0, sr, WARMUP + N, 0.2);
+        let mut out_low = low_e.clone();
+        let mut out_mid = mid_ref.clone();
+        for chunk in out_low.chunks_mut(256) {
+            boost.process(chunk);
+        }
+        boost.reset();
+        for chunk in out_mid.chunks_mut(256) {
+            boost.process(chunk);
+        }
+        let rms_low = compute_waveform_metrics(&out_low[WARMUP..]).rms_db;
+        let rms_mid = compute_waveform_metrics(&out_mid[WARMUP..]).rms_db;
+        assert!(
+            (rms_mid - rms_low).abs() < 0.1,
+            "30 Hz subsonic HP attenuated 82.41 Hz too much: diff = {:.3} dB",
+            rms_mid - rms_low
+        );
+
+        // 2) Riel 18 V acotado frente a señal extrema (+26 dB sobre 0 dBFS).
+        boost.reset();
+        boost.set_gain_db(26.0);
+        let mut hot = sine_1k.iter().map(|&x| x * 4.0).collect::<Vec<_>>();
+        for chunk in hot.chunks_mut(256) {
+            boost.process(chunk);
+        }
+        let mut max_hot = 0.0_f32;
+        for &y in &hot {
+            assert!(y.is_finite() && y.abs() <= 2.55, "18V rail exceeded: {y}");
+            max_hot = max_hot.max(y.abs());
+        }
+        assert!(
+            max_hot > 1.8,
+            "expected 18V headroom utilization, got max={max_hot}"
+        );
+
+        // 3) JFET introduce H2 musical significativo respecto a Op-Amp.
+        boost.reset();
+        boost.set_mode(1.0);
+        boost.set_gain_db(18.0);
+        let (sig_j, f_j) = generate_coherent_sine(1_000.0, sr, WARMUP + N, 0.15);
+        let mut out_j = sig_j;
+        for chunk in out_j.chunks_mut(256) {
+            boost.process(chunk);
+        }
+        let m_j =
+            compute_harmonic_metrics(&out_j[WARMUP..], sr, WindowKind::BlackmanHarris4, Some(f_j));
+        assert!(
+            m_j.h2_db > -55.0,
+            "JFET mode should generate warm H2: {} dB",
+            m_j.h2_db
+        );
+
+        // 4) Tilt EQ balance (-6 dB vs +6 dB en graves y agudos).
+        boost.reset();
+        boost.set_mode(0.0);
+        boost.set_gain_db(0.0);
+        boost.set_tilt_db(6.0);
+        let (bass, _) = generate_coherent_sine(120.0, sr, WARMUP + N, 0.2);
+        let (treble, _) = generate_coherent_sine(5_000.0, sr, WARMUP + N, 0.2);
+        let mut out_b = bass;
+        let mut out_t = treble;
+        for chunk in out_b.chunks_mut(256) {
+            boost.process(chunk);
+        }
+        boost.reset();
+        for chunk in out_t.chunks_mut(256) {
+            boost.process(chunk);
+        }
+        let b_db = compute_waveform_metrics(&out_b[WARMUP..]).rms_db;
+        let t_db = compute_waveform_metrics(&out_t[WARMUP..]).rms_db;
+        assert!(
+            t_db - b_db > 8.0,
+            "Tilt +6 dB should boost highs vs lows: treble={t_db}, bass={b_db}"
+        );
+    }
+
+    #[test]
+    fn overdrive_unified_6knob_precut_asym_clean_blend_and_aliasing() {
+        const WARMUP: usize = 2048;
+        const N: usize = 4096;
+        let sr = 48_000.0_f32;
+
+        // 1) Pre-Cut 720 Hz reduce IMD en quintas graves respecto a Pre-Cut 35 Hz.
+        let mut od = Overdrive::new();
+        od.prepare(sr, 256);
+        od.set_drive_db(28.0);
+        od.set_asymmetry(0.0);
+        od.set_clean_blend(0.0);
+        od.set_tone_hz(10_000.0);
+        od.set_level_db(0.0);
+
+        let f1 = 110.0_f32;
+        let f2 = 165.0_f32;
+        let two_tone: Vec<f32> = (0..(WARMUP + N))
+            .map(|i| {
+                let t = i as f32 / sr;
+                0.25 * (2.0 * std::f32::consts::PI * f1 * t).sin()
+                    + 0.25 * (2.0 * std::f32::consts::PI * f2 * t).sin()
+            })
+            .collect();
+
+        od.set_low_cut_hz(35.0);
+        od.reset();
+        let mut y_full = two_tone.clone();
+        for chunk in y_full.chunks_mut(256) {
+            od.process(chunk);
+        }
+        let imd_full = compute_imd_db(&y_full[WARMUP..], sr, f1, f2);
+
+        od.set_low_cut_hz(720.0);
+        od.reset();
+        let mut y_ts = two_tone;
+        for chunk in y_ts.chunks_mut(256) {
+            od.process(chunk);
+        }
+        let imd_ts = compute_imd_db(&y_ts[WARMUP..], sr, f1, f2);
+        assert!(
+            imd_ts < imd_full - 6.0,
+            "TS Pre-Cut 720 Hz should reduce bass IMD vs 35 Hz: ts={imd_ts} dB, full={imd_full} dB"
+        );
+
+        // 2) Asymmetry 0% (solo impares) vs 100% (pares marcados).
+        let (sine_1k, f_1k) = generate_coherent_sine(1_000.0, sr, WARMUP + N, 0.25);
+        od.set_low_cut_hz(60.0);
+        od.set_drive_db(24.0);
+        od.set_asymmetry(0.0);
+        od.reset();
+        let mut y_sym = sine_1k.clone();
+        for chunk in y_sym.chunks_mut(256) {
+            od.process(chunk);
+        }
+        let m_sym = compute_harmonic_metrics(
+            &y_sym[WARMUP..],
+            sr,
+            WindowKind::BlackmanHarris4,
+            Some(f_1k),
+        );
+        assert!(
+            m_sym.even_vs_fund_db < -55.0,
+            "Asym 0% leaked even harmonics: {} dB",
+            m_sym.even_vs_fund_db
+        );
+
+        od.set_asymmetry(100.0);
+        od.reset();
+        let mut y_asym = sine_1k;
+        for chunk in y_asym.chunks_mut(256) {
+            od.process(chunk);
+        }
+        let m_asym = compute_harmonic_metrics(
+            &y_asym[WARMUP..],
+            sr,
+            WindowKind::BlackmanHarris4,
+            Some(f_1k),
+        );
+        assert!(
+            m_asym.even_vs_fund_db > -26.0,
+            "Asym 100% should yield strong even harmonics: {} dB",
+            m_asym.even_vs_fund_db
+        );
+
+        // 3) Clean Blend: 100% plano en banda (incluso con Tone oscuro) y 50% sin muesca de comb filtering.
+        od.set_drive_db(0.0);
+        od.set_low_cut_hz(30.0);
+        od.set_asymmetry(0.0);
+        od.set_tone_hz(1_500.0);
+        od.set_clean_blend(100.0);
+        od.set_level_db(0.0);
+        od.reset();
+        let in_db = lin_to_db(0.1 / std::f32::consts::SQRT_2);
+        for &freq_blend in &[1_000.0_f32, 8_000.0_f32] {
+            let (tone_sig, _) = generate_coherent_sine(freq_blend, sr, WARMUP + N, 0.1);
+            let mut y_100 = tone_sig;
+            od.reset();
+            for chunk in y_100.chunks_mut(256) {
+                od.process(chunk);
+            }
+            let out_100_db = compute_waveform_metrics(&y_100[WARMUP..]).rms_db;
+            assert!(
+                (out_100_db - in_db).abs() < 0.25,
+                "Clean Blend 100% no fue plano en {freq_blend} Hz: in={in_db:.2} dB, out={out_100_db:.2} dB"
+            );
+        }
+
+        od.set_tone_hz(12_000.0);
+        od.set_clean_blend(50.0);
+        let (mid_tone, _) = generate_coherent_sine(4_000.0, sr, WARMUP + N, 0.1);
+        let mut y_4k = mid_tone;
+        od.reset();
+        for chunk in y_4k.chunks_mut(256) {
+            od.process(chunk);
+        }
+        let blend_4k_db = compute_waveform_metrics(&y_4k[WARMUP..]).rms_db;
+        assert!(
+            (blend_4k_db - in_db).abs() < 1.2,
+            "Clean Blend 50% comb-filtered 4 kHz: in={in_db:.2} dB, out={blend_4k_db:.2} dB"
+        );
+
+        let (hi_tone, _) = generate_coherent_sine(8_000.0, sr, WARMUP + N, 0.1);
+        let mut y_blend = hi_tone;
+        od.reset();
+        for chunk in y_blend.chunks_mut(256) {
+            od.process(chunk);
+        }
+        let blend_8k_db = compute_waveform_metrics(&y_blend[WARMUP..]).rms_db;
+        assert!(
+            blend_8k_db > in_db - 2.8,
+            "Clean Blend 50% cayó demasiado en 8 kHz (posible comb): in={in_db:.2} dB, out={blend_8k_db:.2} dB"
+        );
+
+        // 4) Rechazo de aliasing > 25 dB en 4,370 Hz (+24 dB drive @ 48 kHz) frente a tanh 1x.
+        let (hi_stress, f_stress) = generate_coherent_sine(4_370.0, sr, WARMUP + N, 1.0);
+        let naive_drive = db_to_lin(24.0);
+        let naive_out: Vec<f32> = hi_stress
+            .iter()
+            .map(|&x| (x * naive_drive).tanh())
+            .collect();
+        let m_naive = compute_harmonic_metrics(
+            &naive_out[WARMUP..],
+            sr,
+            WindowKind::BlackmanHarris4,
+            Some(f_stress),
+        );
+
+        od.set_drive_db(24.0);
+        od.set_low_cut_hz(100.0);
+        od.set_asymmetry(0.0);
+        od.set_clean_blend(0.0);
+        od.set_tone_hz(12_000.0);
+        od.set_level_db(0.0);
+        od.reset();
+        let mut od_out = hi_stress;
+        for chunk in od_out.chunks_mut(256) {
+            od.process(chunk);
+        }
+        let m_od = compute_harmonic_metrics(
+            &od_out[WARMUP..],
+            sr,
+            WindowKind::BlackmanHarris4,
+            Some(f_stress),
+        );
+        let gain_asnr = m_od.aliasing_snr_db - m_naive.aliasing_snr_db;
+        assert!(
+            gain_asnr > 25.0,
+            "Overdrive aliasing reduction < 25 dB: +{gain_asnr:.2} dB (naive={}, od={})",
+            m_naive.aliasing_snr_db,
+            m_od.aliasing_snr_db
+        );
+    }
+
+    #[test]
+    fn tube_preamp_12ax7_koren_harmonics_dynamic_sag_and_fs_invariance() {
+        const WARMUP: usize = 2048;
+        const N: usize = 4096;
+
+        // 1) Armónicos H2 + H3 y ausencia de offset DC.
+        let sr = 48_000.0_f32;
+        let mut tube = TubePreamp::new();
+        tube.prepare(sr, 256);
+        tube.set_gain_db(22.0);
+        tube.set_stages(0.0);
+        tube.set_bias_pct(50.0);
+        tube.set_tone_db(0.0);
+        tube.set_level_db(0.0);
+
+        let (sine_1k, f_1k) = generate_coherent_sine(1_000.0, sr, WARMUP + N, 0.25);
+        let mut y = sine_1k;
+        for chunk in y.chunks_mut(256) {
+            tube.process(chunk);
+        }
+        let mean = y[WARMUP..].iter().sum::<f32>() / N as f32;
+        assert!(mean.abs() < 0.01, "12AX7 leaked DC mean={mean}");
+
+        let m = compute_harmonic_metrics(&y[WARMUP..], sr, WindowKind::BlackmanHarris4, Some(f_1k));
+        assert!(
+            m.h2_db > -45.0,
+            "12AX7 lacks even harmonics H2: {}",
+            m.h2_db
+        );
+        assert!(m.h3_db > -45.0, "12AX7 lacks odd harmonics H3: {}", m.h3_db);
+
+        // 2) Compresión dinámica por Bias/Sag ante ráfaga fuerte vs débil.
+        tube.set_bias_pct(100.0);
+        tube.reset();
+        let (burst, _) = generate_coherent_sine(220.0, sr, 9600, 0.7);
+        let mut y_sag = burst;
+        for chunk in y_sag.chunks_mut(256) {
+            tube.process(chunk);
+        }
+        let head_rms = compute_waveform_metrics(&y_sag[256..1024]).rms;
+        let tail_rms = compute_waveform_metrics(&y_sag[6000..8500]).rms;
+        assert!(
+            tail_rms <= head_rms * 0.99,
+            "dynamic sag did not compress sustained signal: head={head_rms}, tail={tail_rms}"
+        );
+
+        // 3) Conmutación suave 2x <-> 3x sin desbordamientos.
+        tube.set_stages(1.0);
+        let (sine_3x, _) = generate_coherent_sine(440.0, sr, 2048, 0.25);
+        let mut y_3x = sine_3x;
+        for chunk in y_3x.chunks_mut(128) {
+            tube.process(chunk);
+        }
+        for &s in &y_3x {
+            assert!(s.is_finite() && s.abs() < 5.0);
+        }
+
+        // 4) Invarianza de THD entre 44.1, 48, 96 y 192 kHz (< 1.5% absoluto con M(fs)).
+        let mut thds = Vec::new();
+        for &test_sr in &[44_100.0_f32, 48_000.0, 96_000.0, 192_000.0] {
+            let mut tp = TubePreamp::new();
+            let block = 256;
+            let len = if test_sr > 100_000.0 { 16_384 } else { 4096 };
+            let warm = if test_sr > 100_000.0 { 4096 } else { 2048 };
+            tp.prepare(test_sr, block);
+            tp.set_gain_db(18.0);
+            tp.set_stages(0.0);
+            tp.set_bias_pct(25.0);
+            tp.set_tone_db(0.0);
+            tp.set_level_db(0.0);
+            let (s_in, f_ex) = generate_coherent_sine(1_000.0, test_sr, warm + len, 0.2);
+            let mut s_out = s_in;
+            for ch in s_out.chunks_mut(block) {
+                tp.process(ch);
+            }
+            let hm = compute_harmonic_metrics(
+                &s_out[warm..],
+                test_sr,
+                WindowKind::BlackmanHarris4,
+                Some(f_ex),
+            );
+            thds.push(hm.thd_percent);
+        }
+        let max_t = thds.iter().copied().fold(0.0_f32, f32::max);
+        let min_t = thds.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(
+            max_t - min_t < 1.5,
+            "12AX7 THD drifted across sample rates: {thds:?}"
         );
     }
 }
